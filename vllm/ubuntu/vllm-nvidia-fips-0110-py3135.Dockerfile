@@ -1,5 +1,5 @@
 # Use FIPS-compliant Python as base image
-ARG PYTHON_BASE_IMAGE="fips-python-3.12.9-ubuntu20-img"
+ARG PYTHON_BASE_IMAGE="fips-python-3.13.5-ubuntu20-img"
 FROM $PYTHON_BASE_IMAGE
 
 USER root
@@ -41,9 +41,9 @@ RUN uv pip install vllm==0.11.0 --system
 
 # FIPS FIX: Patch vLLM to use SHA256 instead of MD5 (FIPS-compliant)
 RUN sed -i 's/hashlib\.md5(/hashlib.sha256(/g' \
-    /opt/python-fips/lib/python3.12/site-packages/vllm/model_executor/models/registry.py && \
+    /opt/python-fips/lib/python3.13/site-packages/vllm/model_executor/models/registry.py && \
     echo "✓ Patched vLLM registry.py for FIPS compliance (MD5 → SHA256)" && \
-    grep -n "sha256" /opt/python-fips/lib/python3.12/site-packages/vllm/model_executor/models/registry.py
+    grep -n "sha256" /opt/python-fips/lib/python3.13/site-packages/vllm/model_executor/models/registry.py
 
 WORKDIR /app
 
