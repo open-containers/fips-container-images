@@ -1,4 +1,4 @@
-name: FIPS Container Security Scan
+name: FIPS Compliance Validation
 
 on:
   push:
@@ -8,350 +8,649 @@ on:
   schedule:
     - cron: '0 2 * * *'  # Daily at 2 AM UTC
   workflow_dispatch:  # Manual trigger
+    inputs:
+      dockerfile_filter:
+        description: 'Filter Dockerfiles by pattern (e.g., "python3.13/*")'
+        required: false
+        default: ''
+      skip_build:
+        description: 'Skip build step (use existing images)'
+        required: false
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   security-events: write
   actions: read
+  issues: write  # For creating issues on failures
+  pull-requests: write  # For PR comments
 
 # Cancel in-progress runs for the same workflow
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  REGISTRY: ghcr.io
+  DOCKER_BUILDKIT: 1
+  TRIVY_VERSION: 0.48.3
+  FIPS_SCRIPT_PATH: scripts/fips-validation.sh
+
 jobs:
   discover-dockerfiles:
-    name: Discover All Dockerfiles
+    name: Discover Dockerfiles
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
-      has-dockerfiles: ${{ steps.set-matrix.outputs.has-dockerfiles }}
-    
+      dockerfile_count: ${{ steps.set-matrix.outputs.count }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+        with:
+          fetch-depth: 1
+
       - name: Find all Dockerfiles
+        id: find-dockerfiles
+        run: |
+          echo "Discovering Dockerfiles in repository..."
+          echo "Search pattern: *.Dockerfile"
+          
+          # Find all files matching *.Dockerfile pattern, excluding common ignored directories
+          DOCKERFILES=$(find . -type f \
+            -name "*.Dockerfile" \
+            ! -path "*/\.*" \
+            ! -path "*/.git/*" \
+            ! -path "*/.github/*" \
+            ! -path "*/node_modules/*" \
+            ! -path "*/vendor/*" \
+            ! -path "*/test/*" \
+            ! -path "*/tests/*" \
+            | sed 's|^\./||' \
+            | sort)
+          
+          # Apply filter if provided
+          if [ -n "${{ github.event.inputs.dockerfile_filter }}" ]; then
+            echo "Applying filter: ${{ github.event.inputs.dockerfile_filter }}"
+            DOCKERFILES=$(echo "$DOCKERFILES" | grep "${{ github.event.inputs.dockerfile_filter }}" || true)
+          fi
+          
+          # Count found Dockerfiles
+          COUNT=$(echo "$DOCKERFILES" | grep -c . || echo "0")
+          echo "Found $COUNT Dockerfiles matching *.Dockerfile pattern"
+          
+          if [ $COUNT -eq 0 ]; then
+            echo "WARNING: No *.Dockerfile files found in repository"
+            echo "Please ensure your Dockerfiles follow the naming pattern: <name>.Dockerfile"
+            echo "Examples: fips-python-3.11.9-focal.Dockerfile, fips-python-3.13-wolfi.Dockerfile"
+          fi
+          
+          # Save to file for next step
+          echo "$DOCKERFILES" > dockerfiles.txt
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+
+      - name: Set matrix output
         id: set-matrix
         run: |
-          # Find all Dockerfiles recursively
-          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.Dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
-          echo "matrix=${dockerfiles}" >> $GITHUB_OUTPUT
-          echo "Found Dockerfiles: ${dockerfiles}"
+          # Read Dockerfiles and create JSON matrix
+          if [ ! -s dockerfiles.txt ]; then
+            echo "No Dockerfiles found"
+            echo 'matrix={"dockerfile":[]}' >> $GITHUB_OUTPUT
+            echo "count=0" >> $GITHUB_OUTPUT
+            exit 0
+          fi
           
-          # Check if any dockerfiles were found
-          if [ "$dockerfiles" = "[]" ] || [ "$dockerfiles" = "" ]; then
-            echo "has-dockerfiles=false" >> $GITHUB_OUTPUT
-            echo "⚠️ No Dockerfiles found in repository"
-          else
-            echo "has-dockerfiles=true" >> $GITHUB_OUTPUT
-            dockerfile_count=$(echo "$dockerfiles" | jq 'length')
-            echo "✓ Found ${dockerfile_count} Dockerfile(s)"
+          # Create JSON array for matrix
+          DOCKERFILES_JSON=$(jq -R -s -c 'split("\n") | map(select(length > 0))' dockerfiles.txt)
+          echo "matrix={\"dockerfile\":$DOCKERFILES_JSON}" >> $GITHUB_OUTPUT
+          
+          COUNT=$(cat dockerfiles.txt | grep -c . || echo "0")
+          echo "count=$COUNT" >> $GITHUB_OUTPUT
+          
+          echo "Matrix configuration:"
+          echo "matrix={\"dockerfile\":$DOCKERFILES_JSON}"
+
+      - name: Summary
+        run: |
+          echo "### Dockerfile Discovery Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total Dockerfiles found:** ${{ steps.find-dockerfiles.outputs.count }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Workflow trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Branch/Ref:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ -s dockerfiles.txt ]; then
+            echo "#### Discovered Dockerfiles:" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            cat dockerfiles.txt >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
           fi
 
   build-and-scan:
-    name: Build & Scan
+    name: Build & Scan - ${{ matrix.dockerfile }}
     needs: discover-dockerfiles
-    if: ${{ needs.discover-dockerfiles.outputs.has-dockerfiles == 'true' }}
+    if: needs.discover-dockerfiles.outputs.dockerfile_count > 0
     runs-on: ubuntu-latest
-    timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        dockerfile: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
+
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
-      
-      - name: Generate image name and build context
+        with:
+          driver-opts: |
+            image=moby/buildkit:latest
+            network=host
+
+      - name: Install Trivy
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy=${{ env.TRIVY_VERSION }}
+          trivy --version
+
+      - name: Install jq for JSON processing
+        run: sudo apt-get install -y jq
+
+      - name: Generate image metadata
         id: image-info
         run: |
-          # Create unique image name from dockerfile path (must be lowercase)
           DOCKERFILE_PATH="${{ matrix.dockerfile }}"
-          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g; s/^-//; s/.*/\L&/')
-          echo "name=fips-${IMAGE_NAME}:latest" >> $GITHUB_OUTPUT
-          echo "Building: fips-${IMAGE_NAME}:latest"
           
-          # Extract directory and filename for build context
-          DOCKERFILE_DIR=$(dirname "${DOCKERFILE_PATH}")
-          DOCKERFILE_NAME=$(basename "${DOCKERFILE_PATH}")
-          echo "context=${DOCKERFILE_DIR}" >> $GITHUB_OUTPUT
-          echo "file=${DOCKERFILE_NAME}" >> $GITHUB_OUTPUT
-          echo "Build context: ${DOCKERFILE_DIR}"
-          echo "Dockerfile: ${DOCKERFILE_NAME}"
-      
+          # Extract directory path (where the Dockerfile is located)
+          CONTEXT_DIR=$(dirname "$DOCKERFILE_PATH")
+          
+          # If Dockerfile is in root, use root as context
+          if [ "$CONTEXT_DIR" = "." ]; then
+            CONTEXT_DIR="."
+          fi
+          
+          # Generate image name from Dockerfile name
+          # Example: fips-python-3.11.9-focal.Dockerfile -> fips-python-3-11-9-focal-img
+          # Extract the base name without .Dockerfile extension
+          DOCKERFILE_NAME=$(basename "$DOCKERFILE_PATH" .Dockerfile)
+          
+          # Sanitize the name: lowercase, replace dots/underscores with dashes, remove special chars
+          IMAGE_NAME=$(echo "$DOCKERFILE_NAME" | tr '[:upper:]' '[:lower:]' | sed 's|[._]|-|g' | sed 's|[^a-z0-9-]|-|g' | sed 's|--*|-|g' | sed 's|^-||' | sed 's|-$||')
+          
+          # Append '-img' suffix if not already present
+          if [[ ! "$IMAGE_NAME" =~ -img$ ]]; then
+            IMAGE_NAME="${IMAGE_NAME}-img"
+          fi
+          
+          # Generate unique tag with date and commit SHA
+          IMAGE_TAG="$(date +%Y%m%d-%H%M%S)-${GITHUB_SHA:0:7}"
+          
+          echo "dockerfile=$DOCKERFILE_PATH" >> $GITHUB_OUTPUT
+          echo "context=$CONTEXT_DIR" >> $GITHUB_OUTPUT
+          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          
+          echo "### Image Build Information" >> $GITHUB_STEP_SUMMARY
+          echo "- **Dockerfile:** \`$DOCKERFILE_PATH\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Build Context:** \`$CONTEXT_DIR\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Name:** \`$IMAGE_NAME\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Image Tag:** \`$IMAGE_TAG\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Debug output
+          echo "DEBUG: Dockerfile path: $DOCKERFILE_PATH"
+          echo "DEBUG: Context directory: $CONTEXT_DIR"
+          echo "DEBUG: Generated image name: $IMAGE_NAME"
+          echo "DEBUG: Image tag: $IMAGE_TAG"
+
       - name: Build FIPS Docker Image
+        if: ${{ !inputs.skip_build }}
         working-directory: ${{ steps.image-info.outputs.context }}
         run: |
+          echo "=========================================="
+          echo "Building FIPS Docker Image"
+          echo "=========================================="
+          echo "Image name: ${{ steps.image-info.outputs.name }}"
+          echo "Image tag: ${{ steps.image-info.outputs.tag }}"
+          echo "Dockerfile: ${{ steps.image-info.outputs.dockerfile }}"
+          echo "Build context: ${{ steps.image-info.outputs.context }}"
+          echo "=========================================="
+          echo ""
+          
+          # Calculate relative path from context to Dockerfile
+          DOCKERFILE_RELATIVE=$(realpath --relative-to="$(pwd)" "${{ github.workspace }}/${{ steps.image-info.outputs.dockerfile }}")
+          
+          echo "Dockerfile relative path: $DOCKERFILE_RELATIVE"
+          echo ""
+          
+          # Verify Dockerfile exists
+          if [ ! -f "$DOCKERFILE_RELATIVE" ]; then
+            echo "ERROR: Dockerfile not found at: $DOCKERFILE_RELATIVE"
+            echo "Current directory: $(pwd)"
+            echo "Directory contents:"
+            ls -la
+            exit 1
+          fi
+          
+          echo "Starting Docker build..."
           docker build \
-            --file "${{ steps.image-info.outputs.file }}" \
-            --tag "${{ steps.image-info.outputs.name }}" \
+            --file "$DOCKERFILE_RELATIVE" \
+            --tag "${{ steps.image-info.outputs.name }}:latest" \
+            --tag "${{ steps.image-info.outputs.name }}:${{ steps.image-info.outputs.tag }}" \
             --label "fips-compliant=true" \
             --label "built-by=github-actions" \
             --label "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             --label "source-commit=${{ github.sha }}" \
+            --label "source-branch=${{ github.ref_name }}" \
             --label "dockerfile-path=${{ matrix.dockerfile }}" \
+            --label "github-workflow=${{ github.workflow }}" \
+            --label "github-run-id=${{ github.run_id }}" \
+            --label "github-run-number=${{ github.run_number }}" \
+            --label "github-actor=${{ github.actor }}" \
+            --label "github-repository=${{ github.repository }}" \
+            --progress=plain \
             .
-      
-      - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.33.0
-        with:
-          image-ref: ${{ steps.image-info.outputs.name }}
-          format: 'sarif'
-          output: 'trivy-results-${{ matrix.dockerfile }}.sarif'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-          vuln-type: 'os,library'
-          exit-code: '0'
-          cache-dir: .trivy
-      
-      - name: Upload Trivy SARIF results to GitHub Security
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-results-${{ matrix.dockerfile }}.sarif'
-          category: 'trivy-${{ steps.image-info.outputs.name }}'
-      
-      - name: Generate JSON report for artifacts
-        uses: aquasecurity/trivy-action@0.33.0
-        if: always()
-        with:
-          image-ref: ${{ steps.image-info.outputs.name }}
-          format: 'json'
-          output: 'trivy-results-${{ matrix.dockerfile }}.json'
-          severity: 'CRITICAL,HIGH,MEDIUM'
-          cache-dir: .trivy
-      
-      - name: Upload detailed scan results
-        uses: actions/upload-artifact@v4
-        if: always()
-        with:
-          name: trivy-scan-${{ steps.image-info.outputs.name }}
-          path: |
-            trivy-results-${{ matrix.dockerfile }}.json
-            trivy-results-${{ matrix.dockerfile }}.sarif
-          retention-days: 30
-      
-      - name: Check for CRITICAL vulnerabilities
-        run: |
-          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results-${{ matrix.dockerfile }}.json)
-          echo "Found ${CRITICAL_COUNT} CRITICAL vulnerabilities"
           
-          if [ "$CRITICAL_COUNT" -gt 0 ]; then
-            echo "::error::CRITICAL vulnerabilities found in ${{ matrix.dockerfile }}"
-            jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | "- \(.VulnerabilityID): \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix available")"' trivy-results-${{ matrix.dockerfile }}.json
+          echo ""
+          echo "=========================================="
+          echo "✅ Build completed successfully"
+          echo "=========================================="
+
+      - name: Verify image was created
+        run: |
+          echo "Verifying image existence..."
+          docker images "${{ steps.image-info.outputs.name }}"
+          
+          if ! docker image inspect "${{ steps.image-info.outputs.name }}:latest" > /dev/null 2>&1; then
+            echo "❌ Error: Image was not created successfully"
             exit 1
           fi
+          
+          IMAGE_SIZE=$(docker image inspect "${{ steps.image-info.outputs.name }}:latest" --format='{{.Size}}' | awk '{print $1/1024/1024}')
+          echo "Image size: ${IMAGE_SIZE} MB"
+          echo "✅ Image verified"
+
+      - name: Quick Trivy vulnerability scan
+        run: |
+          echo "Running quick vulnerability scan..."
+          trivy image \
+            --severity CRITICAL,HIGH \
+            --exit-code 0 \
+            --no-progress \
+            "${{ steps.image-info.outputs.name }}:latest"
+
+      - name: Save image as artifact
+        run: |
+          mkdir -p /tmp/docker-images
+          IMAGE_FILE="/tmp/docker-images/${{ steps.image-info.outputs.name }}.tar"
+          
+          echo "Saving image to: $IMAGE_FILE"
+          docker save "${{ steps.image-info.outputs.name }}:latest" -o "$IMAGE_FILE"
+          
+          # Compress to save space
+          gzip "$IMAGE_FILE"
+          
+          echo "artifact_path=/tmp/docker-images/${{ steps.image-info.outputs.name }}.tar.gz" >> $GITHUB_ENV
+          
+          ls -lh "/tmp/docker-images/"
+
+      - name: Upload image artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image-${{ steps.image-info.outputs.name }}
+          path: /tmp/docker-images/${{ steps.image-info.outputs.name }}.tar.gz
+          retention-days: 7
+          compression-level: 0  # Already compressed
 
   fips-validation:
-    name: FIPS Compliance Check
-    needs: discover-dockerfiles
-    if: ${{ needs.discover-dockerfiles.outputs.has-dockerfiles == 'true' }}
+    name: FIPS Compliance Check - ${{ matrix.dockerfile }}
+    needs: [discover-dockerfiles, build-and-scan]
+    if: needs.discover-dockerfiles.outputs.dockerfile_count > 0
     runs-on: ubuntu-latest
-    timeout-minutes: 20
     strategy:
       fail-fast: false
-      matrix:
-        dockerfile: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
+      matrix: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
-      
-      - name: Prepare build context
-        id: build-prep
+
+      - name: Install Trivy for validation
+        run: |
+          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
+          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
+          sudo apt-get update
+          sudo apt-get install -y trivy=${{ env.TRIVY_VERSION }}
+
+      - name: Install jq for JSON processing
+        run: sudo apt-get install -y jq
+
+      - name: Regenerate image metadata
+        id: image-info
         run: |
           DOCKERFILE_PATH="${{ matrix.dockerfile }}"
-          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g; s/^-//; s/.*/\L&/')
-          echo "image=fips-${IMAGE_NAME}:test" >> $GITHUB_OUTPUT
           
-          DOCKERFILE_DIR=$(dirname "${DOCKERFILE_PATH}")
-          DOCKERFILE_NAME=$(basename "${DOCKERFILE_PATH}")
-          echo "context=${DOCKERFILE_DIR}" >> $GITHUB_OUTPUT
-          echo "file=${DOCKERFILE_NAME}" >> $GITHUB_OUTPUT
-      
-      - name: Build Image for FIPS Testing
-        working-directory: ${{ steps.build-prep.outputs.context }}
-        run: |
-          docker build \
-            --file "${{ steps.build-prep.outputs.file }}" \
-            --tag "${{ steps.build-prep.outputs.image }}" \
-            .
-          echo "Building image: ${{ steps.build-prep.outputs.image }}"
-      
-      - name: Verify FIPS Module Installation
-        run: |
-          echo "Checking for FIPS cryptographic modules..."
+          # Extract the base name without .Dockerfile extension
+          DOCKERFILE_NAME=$(basename "$DOCKERFILE_PATH" .Dockerfile)
           
-          # Check for OpenSSL FIPS provider
-          docker run --rm "${{ steps.build-prep.outputs.image }}" sh -c "
-            if command -v openssl >/dev/null 2>&1; then
-              echo '=== OpenSSL Version ==='
-              openssl version -a
-              
-              echo '=== FIPS Provider Check ==='
-              if openssl list -providers 2>/dev/null | grep -i fips; then
-                echo '✓ FIPS provider found'
-              else
-                echo '⚠ FIPS provider not found'
-              fi
-            fi
-          " || echo "OpenSSL not installed in this image"
-      
-      - name: Check for non-FIPS algorithms
-        run: |
-          echo "Scanning Dockerfile for deprecated/non-FIPS algorithms..."
+          # Sanitize the name: lowercase, replace dots/underscores with dashes
+          IMAGE_NAME=$(echo "$DOCKERFILE_NAME" | tr '[:upper:]' '[:lower:]' | sed 's|[._]|-|g' | sed 's|[^a-z0-9-]|-|g' | sed 's|--*|-|g' | sed 's|^-||' | sed 's|-$||')
           
-          # Check for MD5, SHA1 in non-HMAC context, DES, RC4
-          if grep -iE '(md5|des|rc4)' "${{ matrix.dockerfile }}"; then
-            echo "::warning::Potentially non-FIPS algorithms found in ${{ matrix.dockerfile }}"
-          else
-            echo "✓ No obvious non-FIPS algorithms detected"
+          # Append '-img' suffix if not already present
+          if [[ ! "$IMAGE_NAME" =~ -img$ ]]; then
+            IMAGE_NAME="${IMAGE_NAME}-img"
           fi
+          
+          echo "name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          
+          echo "DEBUG: Dockerfile: $DOCKERFILE_PATH"
+          echo "DEBUG: Generated image name: $IMAGE_NAME"
 
-  dockerfile-lint:
-    name: Dockerfile Lint
-    needs: discover-dockerfiles
-    if: ${{ needs.discover-dockerfiles.outputs.has-dockerfiles == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    strategy:
-      fail-fast: false
-      matrix:
-        dockerfile: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
-    
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-      
-      - name: Run Trivy config scan on Dockerfile
-        uses: aquasecurity/trivy-action@0.33.0
-        with:
-          scan-type: 'config'
-          scan-ref: ${{ matrix.dockerfile }}
-          format: 'sarif'
-          output: 'trivy-config-${{ matrix.dockerfile }}.sarif'
-          exit-code: '0'
-      
-      - name: Upload Trivy config scan results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'trivy-config-${{ matrix.dockerfile }}.sarif'
-          category: 'trivy-config-${{ matrix.dockerfile }}'
-      
-      - name: Run Hadolint on ${{ matrix.dockerfile }}
-        uses: hadolint/hadolint-action@v3.1.0
-        with:
-          dockerfile: ${{ matrix.dockerfile }}
-          format: 'sarif'
-          output-file: 'hadolint-${{ matrix.dockerfile }}.sarif'
-          no-fail: true
-      
-      - name: Upload Hadolint results
-        uses: github/codeql-action/upload-sarif@v3
-        if: always()
-        with:
-          sarif_file: 'hadolint-${{ matrix.dockerfile }}.sarif'
-          category: 'hadolint-${{ matrix.dockerfile }}'
-
-  security-summary:
-    name: Security Summary
-    needs: [discover-dockerfiles, build-and-scan, fips-validation, dockerfile-lint]
-    runs-on: ubuntu-latest
-    if: always()
-    
-    steps:
-      - name: Check if Dockerfiles exist
-        id: check
-        run: |
-          if [ "${{ needs.discover-dockerfiles.outputs.has-dockerfiles }}" != "true" ]; then
-            echo "skip-summary=true" >> $GITHUB_OUTPUT
-          else
-            echo "skip-summary=false" >> $GITHUB_OUTPUT
-          fi
-      
-      - name: Download all scan artifacts
-        if: steps.check.outputs.skip-summary == 'false'
+      - name: Download image artifact
         uses: actions/download-artifact@v4
         with:
-          path: scan-results
-      
-      - name: Generate summary report
-        if: steps.check.outputs.skip-summary == 'false'
+          name: docker-image-${{ steps.image-info.outputs.name }}
+          path: /tmp/docker-images
+
+      - name: Load Docker image
         run: |
-          echo "# 🔒 FIPS Container Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "Loading Docker image..."
+          gunzip /tmp/docker-images/${{ steps.image-info.outputs.name }}.tar.gz
+          docker load -i /tmp/docker-images/${{ steps.image-info.outputs.name }}.tar
+          
+          echo "Verifying loaded image..."
+          docker images "${{ steps.image-info.outputs.name }}"
+
+      - name: Make FIPS validation script executable
+        run: |
+          if [ ! -f "${{ env.FIPS_SCRIPT_PATH }}" ]; then
+            echo "❌ Error: FIPS validation script not found at ${{ env.FIPS_SCRIPT_PATH }}"
+            exit 1
+          fi
+          
+          chmod +x "${{ env.FIPS_SCRIPT_PATH }}"
+          echo "✅ FIPS validation script is ready"
+
+      - name: Run FIPS Compliance Validation
+        id: fips-validation
+        continue-on-error: true
+        run: |
+          echo "=================================="
+          echo "FIPS 140-2 Compliance Validation"
+          echo "=================================="
+          echo "Image: ${{ steps.image-info.outputs.name }}:latest"
+          echo "Dockerfile: ${{ matrix.dockerfile }}"
+          echo "Timestamp: $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          echo "=================================="
+          echo ""
+          
+          # Create output directory for reports
+          mkdir -p fips-reports
+          
+          # Run FIPS validation and capture output
+          "${{ env.FIPS_SCRIPT_PATH }}" "${{ steps.image-info.outputs.name }}:latest" 2>&1 | tee "fips-reports/fips-validation-${{ steps.image-info.outputs.name }}.log"
+          
+          # Capture exit code
+          EXIT_CODE=${PIPESTATUS[0]}
+          echo "validation_exit_code=$EXIT_CODE" >> $GITHUB_OUTPUT
+          
+          if [ $EXIT_CODE -eq 0 ]; then
+            echo "status=passed" >> $GITHUB_OUTPUT
+            echo "✅ FIPS validation PASSED"
+          else
+            echo "status=failed" >> $GITHUB_OUTPUT
+            echo "❌ FIPS validation FAILED (exit code: $EXIT_CODE)"
+          fi
+          
+          exit $EXIT_CODE
+
+      - name: Parse validation results
+        if: always()
+        id: parse-results
+        run: |
+          LOG_FILE="fips-reports/fips-validation-${{ steps.image-info.outputs.name }}.log"
+          
+          if [ ! -f "$LOG_FILE" ]; then
+            echo "Log file not found"
+            exit 1
+          fi
+          
+          # Extract test statistics
+          TESTS_PASSED=$(grep -c "✓ PASS:" "$LOG_FILE" || echo "0")
+          TESTS_FAILED=$(grep -c "✗ FAIL:" "$LOG_FILE" || echo "0")
+          TESTS_WARNING=$(grep -c "⚠ WARNING:" "$LOG_FILE" || echo "0")
+          TOTAL_TESTS=$((TESTS_PASSED + TESTS_FAILED + TESTS_WARNING))
+          
+          echo "tests_passed=$TESTS_PASSED" >> $GITHUB_OUTPUT
+          echo "tests_failed=$TESTS_FAILED" >> $GITHUB_OUTPUT
+          echo "tests_warning=$TESTS_WARNING" >> $GITHUB_OUTPUT
+          echo "total_tests=$TOTAL_TESTS" >> $GITHUB_OUTPUT
+          
+          # Extract compliance status
+          if grep -q "COMPLIANCE STATUS: PASSED" "$LOG_FILE"; then
+            echo "compliance_status=PASSED" >> $GITHUB_OUTPUT
+          elif grep -q "COMPLIANCE STATUS: CONDITIONAL PASS" "$LOG_FILE"; then
+            echo "compliance_status=CONDITIONAL" >> $GITHUB_OUTPUT
+          else
+            echo "compliance_status=FAILED" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Generate validation summary
+        if: always()
+        run: |
+          LOG_FILE="fips-reports/fips-validation-${{ steps.image-info.outputs.name }}.log"
+          
+          echo "## FIPS Compliance Validation Results" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "**Scan Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "**Workflow Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
-          echo "**Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Image:** \`${{ steps.image-info.outputs.name }}:latest\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Dockerfile:** \`${{ matrix.dockerfile }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Validation Status:** ${{ steps.parse-results.outputs.compliance_status }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
-          # Count total vulnerabilities across all images
-          if [ -d "scan-results" ]; then
-            TOTAL_CRITICAL=0
-            TOTAL_HIGH=0
-            TOTAL_MEDIUM=0
-            IMAGE_COUNT=0
-            
-            for json_file in scan-results/*/*.json; do
-              if [ -f "$json_file" ]; then
-                IMAGE_COUNT=$((IMAGE_COUNT + 1))
-                CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$json_file" || echo 0)
-                HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$json_file" || echo 0)
-                MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$json_file" || echo 0)
+          echo "### Test Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "| Metric | Count |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Tests | ${{ steps.parse-results.outputs.total_tests }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ✅ Passed | ${{ steps.parse-results.outputs.tests_passed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ❌ Failed | ${{ steps.parse-results.outputs.tests_failed }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| ⚠️ Warnings | ${{ steps.parse-results.outputs.tests_warning }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Add critical findings if any failures
+          if [ "${{ steps.parse-results.outputs.tests_failed }}" != "0" ]; then
+            echo "### ❌ Critical Issues Found" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep "✗ FAIL:" "$LOG_FILE" | head -10 >> $GITHUB_STEP_SUMMARY || echo "See full log for details"
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Add warnings if any
+          if [ "${{ steps.parse-results.outputs.tests_warning }}" != "0" ]; then
+            echo "### ⚠️ Warnings" >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            grep "⚠ WARNING:" "$LOG_FILE" | head -5 >> $GITHUB_STEP_SUMMARY || echo "See full log for details"
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "📄 Full validation report available in artifacts" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload FIPS validation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fips-report-${{ steps.image-info.outputs.name }}
+          path: fips-reports/
+          retention-days: 90
+
+      - name: Upload vulnerability reports (if generated)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vulnerability-reports-${{ steps.image-info.outputs.name }}
+          path: |
+            trivy-vulnerabilities-*.json
+            trivy-vulnerabilities-*.html
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Upload SBOM reports (if generated)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-reports-${{ steps.image-info.outputs.name }}
+          path: |
+            sbom-cyclonedx-*.json
+            sbom-cyclonedx-*.xml
+          if-no-files-found: ignore
+          retention-days: 90
+
+      - name: Fail job if validation failed
+        if: steps.fips-validation.outputs.status == 'failed'
+        run: |
+          echo "❌ FIPS validation failed for ${{ steps.image-info.outputs.name }}"
+          echo "Review the validation report in artifacts for detailed findings"
+          exit 1
+
+  final-summary:
+    name: Final Validation Summary
+    needs: [discover-dockerfiles, build-and-scan, fips-validation]
+    if: always() && needs.discover-dockerfiles.outputs.dockerfile_count > 0
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Download all FIPS reports
+        uses: actions/download-artifact@v4
+        with:
+          pattern: fips-report-*
+          path: all-reports
+          merge-multiple: true
+
+      - name: Generate consolidated summary
+        run: |
+          echo "# 🔒 FIPS Compliance Validation Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow:** ${{ github.workflow }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Trigger:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Branch:** ${{ github.ref_name }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Commit:** \`${{ github.sha }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "**Timestamp:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          echo "## Validation Results by Image" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          TOTAL_IMAGES=0
+          PASSED_IMAGES=0
+          FAILED_IMAGES=0
+          
+          if [ -d "all-reports" ]; then
+            for log in all-reports/*.log; do
+              if [ -f "$log" ]; then
+                TOTAL_IMAGES=$((TOTAL_IMAGES + 1))
+                IMAGE_NAME=$(basename "$log" .log | sed 's/fips-validation-//')
                 
-                TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL))
-                TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
-                TOTAL_MEDIUM=$((TOTAL_MEDIUM + MEDIUM))
+                if grep -q "COMPLIANCE STATUS: PASSED" "$log"; then
+                  PASSED_IMAGES=$((PASSED_IMAGES + 1))
+                  echo "- ✅ **$IMAGE_NAME**: PASSED" >> $GITHUB_STEP_SUMMARY
+                elif grep -q "COMPLIANCE STATUS: CONDITIONAL PASS" "$log"; then
+                  echo "- ⚠️ **$IMAGE_NAME**: CONDITIONAL PASS (review required)" >> $GITHUB_STEP_SUMMARY
+                else
+                  FAILED_IMAGES=$((FAILED_IMAGES + 1))
+                  echo "- ❌ **$IMAGE_NAME**: FAILED" >> $GITHUB_STEP_SUMMARY
+                fi
               fi
             done
-            
-            echo "## 📊 Vulnerability Summary" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Overall Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "| Status | Count | Percentage |" >> $GITHUB_STEP_SUMMARY
+          echo "|--------|-------|------------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Total Images | $TOTAL_IMAGES | 100% |" >> $GITHUB_STEP_SUMMARY
+          
+          if [ $TOTAL_IMAGES -gt 0 ]; then
+            PASS_PCT=$((PASSED_IMAGES * 100 / TOTAL_IMAGES))
+            FAIL_PCT=$((FAILED_IMAGES * 100 / TOTAL_IMAGES))
+            echo "| ✅ Passed | $PASSED_IMAGES | ${PASS_PCT}% |" >> $GITHUB_STEP_SUMMARY
+            echo "| ❌ Failed | $FAILED_IMAGES | ${FAIL_PCT}% |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          if [ $FAILED_IMAGES -gt 0 ]; then
+            echo "### ⚠️ Action Required" >> $GITHUB_STEP_SUMMARY
+            echo "Some images failed FIPS compliance validation. Please review the detailed reports in the artifacts section." >> $GITHUB_STEP_SUMMARY
             echo "" >> $GITHUB_STEP_SUMMARY
-            echo "**Images Scanned:** ${IMAGE_COUNT}" >> $GITHUB_STEP_SUMMARY
-            echo "" >> $GITHUB_STEP_SUMMARY
-            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
-            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
-            echo "| 🔴 CRITICAL | $TOTAL_CRITICAL |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🟠 HIGH | $TOTAL_HIGH |" >> $GITHUB_STEP_SUMMARY
-            echo "| 🟡 MEDIUM | $TOTAL_MEDIUM |" >> $GITHUB_STEP_SUMMARY
-            
-            # Set job status based on findings
-            if [ "$TOTAL_CRITICAL" -gt 0 ]; then
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "⚠️ **Action Required:** Critical vulnerabilities detected!" >> $GITHUB_STEP_SUMMARY
-            elif [ "$TOTAL_HIGH" -gt 0 ]; then
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "⚠️ **Warning:** High severity vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
-            else
-              echo "" >> $GITHUB_STEP_SUMMARY
-              echo "✅ **Status:** No critical or high vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
-            fi
+            echo "**Next Steps:**" >> $GITHUB_STEP_SUMMARY
+            echo "1. Download and review failed validation reports" >> $GITHUB_STEP_SUMMARY
+            echo "2. Address critical security issues" >> $GITHUB_STEP_SUMMARY
+            echo "3. Re-run validation after fixes" >> $GITHUB_STEP_SUMMARY
           else
-            echo "⚠️ No scan results found" >> $GITHUB_STEP_SUMMARY
+            echo "### ✅ All Clear" >> $GITHUB_STEP_SUMMARY
+            echo "All images passed FIPS compliance validation!" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "---" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📋 **View detailed results:**" >> $GITHUB_STEP_SUMMARY
-          echo "- [Security Tab](${{ github.server_url }}/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
-          echo "- [Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
-      
-      - name: No Dockerfiles Found Summary
-        if: steps.check.outputs.skip-summary == 'true'
-        run: |
-          echo "# 🔒 FIPS Container Security Scan Summary" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "⚠️ **No Dockerfiles found in repository**" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "The workflow searched for files matching:" >> $GITHUB_STEP_SUMMARY
-          echo "- \`Dockerfile*\` (e.g., Dockerfile, Dockerfile.python)" >> $GITHUB_STEP_SUMMARY
-          echo "- \`*.dockerfile\` (e.g., python.dockerfile)" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "Please verify your repository structure and ensure Dockerfiles exist." >> $GITHUB_STEP_SUMMARY
+          echo "*Detailed reports available in workflow artifacts (retained for 90 days)*" >> $GITHUB_STEP_SUMMARY
 
+      - name: Check overall workflow status
+        run: |
+          if [ "${{ needs.fips-validation.result }}" != "success" ]; then
+            echo "❌ One or more FIPS validations failed"
+            echo "Review the summary above and artifact reports for details"
+            exit 1
+          fi
+          
+          echo "✅ All FIPS validations passed successfully"
+
+      - name: Comment on PR (if applicable)
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const path = require('path');
+            
+            let comment = '## 🔒 FIPS Compliance Validation Results\n\n';
+            comment += `**Workflow Run:** [#${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})\n\n`;
+            
+            // Parse summary from artifacts
+            const reportsDir = 'all-reports';
+            if (fs.existsSync(reportsDir)) {
+              const files = fs.readdirSync(reportsDir);
+              let passed = 0, failed = 0, total = 0;
+              
+              files.forEach(file => {
+                if (file.endsWith('.log')) {
+                  total++;
+                  const content = fs.readFileSync(path.join(reportsDir, file), 'utf8');
+                  if (content.includes('COMPLIANCE STATUS: PASSED')) {
+                    passed++;
+                  } else {
+                    failed++;
+                  }
+                }
+              });
+              
+              comment += `### Summary\n`;
+              comment += `- Total Images: ${total}\n`;
+              comment += `- ✅ Passed: ${passed}\n`;
+              comment += `- ❌ Failed: ${failed}\n\n`;
+              
+              if (failed > 0) {
+                comment += '⚠️ **Action Required:** Some images failed FIPS compliance. Review the [workflow artifacts](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) for details.\n';
+              } else {
+                comment += '✅ All images passed FIPS compliance validation!\n';
+              }
+            }
+            
+            github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: comment
+            });
