@@ -35,7 +35,7 @@ jobs:
         id: set-matrix
         run: |
           # Find all Dockerfiles recursively
-          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.Dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
+          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
           echo "matrix=${dockerfiles}" >> $GITHUB_OUTPUT
           echo "Found Dockerfiles: ${dockerfiles}"
           
@@ -70,9 +70,9 @@ jobs:
       - name: Generate image name
         id: image-name
         run: |
-          # Create unique image name from dockerfile path
+          # Create unique image name from dockerfile path (must be lowercase)
           DOCKERFILE_PATH="${{ matrix.dockerfile }}"
-          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g' | sed 's/^-//')
+          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g; s/^-//; s/.*/\L&/')
           echo "name=fips-${IMAGE_NAME}:latest" >> $GITHUB_OUTPUT
           echo "Building: fips-${IMAGE_NAME}:latest"
       
@@ -154,9 +154,10 @@ jobs:
       - name: Build Image for FIPS Testing
         run: |
           DOCKERFILE_PATH="${{ matrix.dockerfile }}"
-          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g' | sed 's/^-//')
+          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g; s/^-//; s/.*/\L&/')
           docker build -f "${{ matrix.dockerfile }}" -t "fips-${IMAGE_NAME}:test" .
           echo "IMAGE_NAME=fips-${IMAGE_NAME}:test" >> $GITHUB_ENV
+          echo "Building image: fips-${IMAGE_NAME}:test"
       
       - name: Verify FIPS Module Installation
         run: |
