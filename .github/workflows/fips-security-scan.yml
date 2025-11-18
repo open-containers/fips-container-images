@@ -160,6 +160,7 @@ jobs:
           DOCKERFILE_PATH="${{ matrix.dockerfile }}"
           
           # Extract directory path (where the Dockerfile is located)
+          # This is the build context
           CONTEXT_DIR=$(dirname "$DOCKERFILE_PATH")
           
           # If Dockerfile is in root, use root as context
@@ -212,27 +213,41 @@ jobs:
           echo "Image tag: ${{ steps.image-info.outputs.tag }}"
           echo "Dockerfile: ${{ steps.image-info.outputs.dockerfile }}"
           echo "Build context: ${{ steps.image-info.outputs.context }}"
+          echo "Working directory: $(pwd)"
           echo "=========================================="
           echo ""
           
-          # Calculate relative path from context to Dockerfile
-          DOCKERFILE_RELATIVE=$(realpath --relative-to="$(pwd)" "${{ github.workspace }}/${{ steps.image-info.outputs.dockerfile }}")
+          # Calculate the Dockerfile name relative to the build context
+          DOCKERFILE_BASENAME=$(basename "${{ steps.image-info.outputs.dockerfile }}")
           
-          echo "Dockerfile relative path: $DOCKERFILE_RELATIVE"
-          echo ""
+          echo "Dockerfile basename: $DOCKERFILE_BASENAME"
           
-          # Verify Dockerfile exists
-          if [ ! -f "$DOCKERFILE_RELATIVE" ]; then
-            echo "ERROR: Dockerfile not found at: $DOCKERFILE_RELATIVE"
+          # Verify Dockerfile exists in current context
+          if [ ! -f "$DOCKERFILE_BASENAME" ]; then
+            echo "ERROR: Dockerfile not found in build context"
+            echo "Looking for: $DOCKERFILE_BASENAME"
             echo "Current directory: $(pwd)"
             echo "Directory contents:"
             ls -la
             exit 1
           fi
           
-          echo "Starting Docker build..."
+          echo "Dockerfile found: $DOCKERFILE_BASENAME"
+          
+          # List files in build context for debugging
+          echo ""
+          echo "Build context contents:"
+          ls -la
+          
+          # Check for patch files in context
+          echo ""
+          echo "Looking for patch files in context:"
+          find . -maxdepth 1 -name "*.patch" -o -name "*.diff"
+          
+          echo ""
+          echo "Starting Docker build with context: ${{ steps.image-info.outputs.context }}"
           docker build \
-            --file "$DOCKERFILE_RELATIVE" \
+            --file "$DOCKERFILE_BASENAME" \
             --tag "${{ steps.image-info.outputs.name }}:latest" \
             --tag "${{ steps.image-info.outputs.name }}:${{ steps.image-info.outputs.tag }}" \
             --label "fips-compliant=true" \
