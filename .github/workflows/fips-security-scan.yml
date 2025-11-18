@@ -35,7 +35,7 @@ jobs:
         id: set-matrix
         run: |
           # Find all Dockerfiles recursively
-          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
+          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.Dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
           echo "matrix=${dockerfiles}" >> $GITHUB_OUTPUT
           echo "Found Dockerfiles: ${dockerfiles}"
           
