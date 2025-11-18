@@ -34,7 +34,6 @@ concurrency:
 env:
   REGISTRY: ghcr.io
   DOCKER_BUILDKIT: 1
-  TRIVY_VERSION: 0.48.3
   FIPS_SCRIPT_PATH: scripts/fips-validation.sh
 
 jobs:
@@ -148,10 +147,8 @@ jobs:
 
       - name: Install Trivy
         run: |
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy=${{ env.TRIVY_VERSION }}
+          # Install Trivy using the official installation script
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
           trivy --version
 
       - name: Install jq for JSON processing
@@ -318,10 +315,9 @@ jobs:
 
       - name: Install Trivy for validation
         run: |
-          wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-          echo "deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
-          sudo apt-get update
-          sudo apt-get install -y trivy=${{ env.TRIVY_VERSION }}
+          # Install Trivy using the official installation script
+          curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin
+          trivy --version
 
       - name: Install jq for JSON processing
         run: sudo apt-get install -y jq
