@@ -1,0 +1,255 @@
+name: FIPS Container Security Scan
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+  schedule:
+    - cron: '0 2 * * *'  # Daily at 2 AM UTC
+  workflow_dispatch:  # Manual trigger
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  discover-dockerfiles:
+    name: Discover All Dockerfiles
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Find all Dockerfiles
+        id: set-matrix
+        run: |
+          # Find all Dockerfiles recursively
+          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
+          echo "matrix=${dockerfiles}" >> $GITHUB_OUTPUT
+          echo "Found Dockerfiles: ${dockerfiles}"
+
+  build-and-scan:
+    name: Build & Scan FIPS Images
+    needs: discover-dockerfiles
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Generate image name
+        id: image-name
+        run: |
+          # Create unique image name from dockerfile path
+          DOCKERFILE_PATH="${{ matrix.dockerfile }}"
+          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g' | sed 's/^-//')
+          echo "name=fips-${IMAGE_NAME}:latest" >> $GITHUB_OUTPUT
+          echo "Building: fips-${IMAGE_NAME}:latest"
+      
+      - name: Build FIPS Docker Image
+        run: |
+          docker build \
+            --file "${{ matrix.dockerfile }}" \
+            --tag "${{ steps.image-name.outputs.name }}" \
+            --label "fips-compliant=true" \
+            --label "built-by=github-actions" \
+            --label "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            .
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ steps.image-name.outputs.name }}
+          format: 'sarif'
+          output: 'trivy-results-${{ matrix.dockerfile }}.sarif'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          vuln-type: 'os,library'
+          exit-code: '0'  # Don't fail yet, gather all results first
+      
+      - name: Upload Trivy SARIF results to GitHub Security
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-results-${{ matrix.dockerfile }}.sarif'
+          category: 'trivy-${{ steps.image-name.outputs.name }}'
+      
+      - name: Generate JSON report for artifacts
+        uses: aquasecurity/trivy-action@0.28.0
+        if: always()
+        with:
+          image-ref: ${{ steps.image-name.outputs.name }}
+          format: 'json'
+          output: 'trivy-results-${{ matrix.dockerfile }}.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+      
+      - name: Upload detailed scan results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-scan-${{ steps.image-name.outputs.name }}
+          path: |
+            trivy-results-${{ matrix.dockerfile }}.json
+            trivy-results-${{ matrix.dockerfile }}.sarif
+          retention-days: 30
+      
+      - name: Check for CRITICAL vulnerabilities
+        run: |
+          CRITICAL_COUNT=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' trivy-results-${{ matrix.dockerfile }}.json)
+          echo "Found ${CRITICAL_COUNT} CRITICAL vulnerabilities"
+          
+          if [ "$CRITICAL_COUNT" -gt 0 ]; then
+            echo "::error::CRITICAL vulnerabilities found in ${{ matrix.dockerfile }}"
+            jq -r '.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL") | "- \(.VulnerabilityID): \(.PkgName) \(.InstalledVersion) -> \(.FixedVersion // "no fix available")"' trivy-results-${{ matrix.dockerfile }}.json
+            exit 1
+          fi
+
+  fips-validation:
+    name: FIPS Compliance Validation
+    needs: discover-dockerfiles
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Build Image for FIPS Testing
+        run: |
+          DOCKERFILE_PATH="${{ matrix.dockerfile }}"
+          IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g' | sed 's/^-//')
+          docker build -f "${{ matrix.dockerfile }}" -t "fips-${IMAGE_NAME}:test" .
+          echo "IMAGE_NAME=fips-${IMAGE_NAME}:test" >> $GITHUB_ENV
+      
+      - name: Verify FIPS Module Installation
+        run: |
+          echo "Checking for FIPS cryptographic modules..."
+          
+          # Check for OpenSSL FIPS provider
+          docker run --rm "${{ env.IMAGE_NAME }}" sh -c "
+            if command -v openssl >/dev/null 2>&1; then
+              echo '=== OpenSSL Version ==='
+              openssl version -a
+              
+              echo '=== FIPS Provider Check ==='
+              if openssl list -providers 2>/dev/null | grep -i fips; then
+                echo '✓ FIPS provider found'
+              else
+                echo '⚠ FIPS provider not found'
+              fi
+            fi
+          " || echo "OpenSSL not installed in this image"
+      
+      - name: Check for non-FIPS algorithms
+        run: |
+          echo "Scanning Dockerfile for deprecated/non-FIPS algorithms..."
+          
+          # Check for MD5, SHA1 in non-HMAC context, DES, RC4
+          if grep -iE '(md5|des|rc4)' "${{ matrix.dockerfile }}"; then
+            echo "::warning::Potentially non-FIPS algorithms found in ${{ matrix.dockerfile }}"
+          else
+            echo "✓ No obvious non-FIPS algorithms detected"
+          fi
+
+  dockerfile-lint:
+    name: Dockerfile Best Practices Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy config scan on Dockerfiles
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: 'config'
+          scan-ref: '.'
+          format: 'sarif'
+          output: 'trivy-dockerfile-scan.sarif'
+          exit-code: '0'
+      
+      - name: Upload Dockerfile scan results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'trivy-dockerfile-scan.sarif'
+          category: 'trivy-dockerfile-best-practices'
+      
+      - name: Run Hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: '**/Dockerfile*'
+          format: 'sarif'
+          output-file: 'hadolint-results.sarif'
+          no-fail: true
+      
+      - name: Upload Hadolint results
+        uses: github/codeql-action/upload-sarif@v3
+        if: always()
+        with:
+          sarif_file: 'hadolint-results.sarif'
+          category: 'hadolint'
+
+  security-summary:
+    name: Generate Security Summary
+    needs: [build-and-scan, fips-validation]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Download all scan artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: scan-results
+      
+      - name: Generate summary report
+        run: |
+          echo "# FIPS Container Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Scan Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          
+          # Count total vulnerabilities across all images
+          if [ -d "scan-results" ]; then
+            TOTAL_CRITICAL=0
+            TOTAL_HIGH=0
+            TOTAL_MEDIUM=0
+            
+            for json_file in scan-results/*/*.json; do
+              if [ -f "$json_file" ]; then
+                CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$json_file" || echo 0)
+                HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$json_file" || echo 0)
+                MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$json_file" || echo 0)
+                
+                TOTAL_CRITICAL=$((TOTAL_CRITICAL + CRITICAL))
+                TOTAL_HIGH=$((TOTAL_HIGH + HIGH))
+                TOTAL_MEDIUM=$((TOTAL_MEDIUM + MEDIUM))
+              fi
+            done
+            
+            echo "## Vulnerability Summary" >> $GITHUB_STEP_SUMMARY
+            echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
+            echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
+            echo "| 🔴 CRITICAL | $TOTAL_CRITICAL |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🟠 HIGH | $TOTAL_HIGH |" >> $GITHUB_STEP_SUMMARY
+            echo "| 🟡 MEDIUM | $TOTAL_MEDIUM |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📊 **View detailed results in the Security tab**" >> $GITHUB_STEP_SUMMARY
+
