@@ -25,6 +25,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has-dockerfiles: ${{ steps.set-matrix.outputs.has-dockerfiles }}
     
     steps:
       - name: Checkout repository
@@ -37,10 +38,21 @@ jobs:
           dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
           echo "matrix=${dockerfiles}" >> $GITHUB_OUTPUT
           echo "Found Dockerfiles: ${dockerfiles}"
+          
+          # Check if any dockerfiles were found
+          if [ "$dockerfiles" = "[]" ] || [ "$dockerfiles" = "" ]; then
+            echo "has-dockerfiles=false" >> $GITHUB_OUTPUT
+            echo "⚠️ No Dockerfiles found in repository"
+          else
+            echo "has-dockerfiles=true" >> $GITHUB_OUTPUT
+            dockerfile_count=$(echo "$dockerfiles" | jq 'length')
+            echo "✓ Found ${dockerfile_count} Dockerfile(s)"
+          fi
 
   build-and-scan:
     name: Build & Scan
     needs: discover-dockerfiles
+    if: ${{ needs.discover-dockerfiles.outputs.has-dockerfiles == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 30
     strategy:
@@ -127,6 +139,7 @@ jobs:
   fips-validation:
     name: FIPS Compliance Check
     needs: discover-dockerfiles
+    if: ${{ needs.discover-dockerfiles.outputs.has-dockerfiles == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 20
     strategy:
@@ -178,6 +191,7 @@ jobs:
   dockerfile-lint:
     name: Dockerfile Lint
     needs: discover-dockerfiles
+    if: ${{ needs.discover-dockerfiles.outputs.has-dockerfiles == 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     strategy:
@@ -222,17 +236,28 @@ jobs:
 
   security-summary:
     name: Security Summary
-    needs: [build-and-scan, fips-validation, dockerfile-lint]
+    needs: [discover-dockerfiles, build-and-scan, fips-validation, dockerfile-lint]
     runs-on: ubuntu-latest
     if: always()
     
     steps:
+      - name: Check if Dockerfiles exist
+        id: check
+        run: |
+          if [ "${{ needs.discover-dockerfiles.outputs.has-dockerfiles }}" != "true" ]; then
+            echo "skip-summary=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip-summary=false" >> $GITHUB_OUTPUT
+          fi
+      
       - name: Download all scan artifacts
+        if: steps.check.outputs.skip-summary == 'false'
         uses: actions/download-artifact@v4
         with:
           path: scan-results
       
       - name: Generate summary report
+        if: steps.check.outputs.skip-summary == 'false'
         run: |
           echo "# 🔒 FIPS Container Security Scan Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -292,4 +317,17 @@ jobs:
           echo "📋 **View detailed results:**" >> $GITHUB_STEP_SUMMARY
           echo "- [Security Tab](${{ github.server_url }}/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
           echo "- [Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
+      
+      - name: No Dockerfiles Found Summary
+        if: steps.check.outputs.skip-summary == 'true'
+        run: |
+          echo "# 🔒 FIPS Container Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "⚠️ **No Dockerfiles found in repository**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "The workflow searched for files matching:" >> $GITHUB_STEP_SUMMARY
+          echo "- \`Dockerfile*\` (e.g., Dockerfile, Dockerfile.python)" >> $GITHUB_STEP_SUMMARY
+          echo "- \`*.dockerfile\` (e.g., python.dockerfile)" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Please verify your repository structure and ensure Dockerfiles exist." >> $GITHUB_STEP_SUMMARY
 
