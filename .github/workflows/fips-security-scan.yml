@@ -14,6 +14,11 @@ permissions:
   security-events: write
   actions: read
 
+# Cancel in-progress runs for the same workflow
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   discover-dockerfiles:
     name: Discover All Dockerfiles
@@ -34,9 +39,10 @@ jobs:
           echo "Found Dockerfiles: ${dockerfiles}"
 
   build-and-scan:
-    name: Build & Scan FIPS Images
+    name: Build & Scan
     needs: discover-dockerfiles
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
@@ -66,17 +72,19 @@ jobs:
             --label "fips-compliant=true" \
             --label "built-by=github-actions" \
             --label "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
+            --label "source-commit=${{ github.sha }}" \
             .
       
       - name: Run Trivy vulnerability scanner
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.0
         with:
           image-ref: ${{ steps.image-name.outputs.name }}
           format: 'sarif'
           output: 'trivy-results-${{ matrix.dockerfile }}.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
           vuln-type: 'os,library'
-          exit-code: '0'  # Don't fail yet, gather all results first
+          exit-code: '0'
+          cache-dir: .trivy
       
       - name: Upload Trivy SARIF results to GitHub Security
         uses: github/codeql-action/upload-sarif@v3
@@ -86,13 +94,14 @@ jobs:
           category: 'trivy-${{ steps.image-name.outputs.name }}'
       
       - name: Generate JSON report for artifacts
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.33.0
         if: always()
         with:
           image-ref: ${{ steps.image-name.outputs.name }}
           format: 'json'
           output: 'trivy-results-${{ matrix.dockerfile }}.json'
           severity: 'CRITICAL,HIGH,MEDIUM'
+          cache-dir: .trivy
       
       - name: Upload detailed scan results
         uses: actions/upload-artifact@v4
@@ -116,9 +125,10 @@ jobs:
           fi
 
   fips-validation:
-    name: FIPS Compliance Validation
+    name: FIPS Compliance Check
     needs: discover-dockerfiles
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     strategy:
       fail-fast: false
       matrix:
@@ -166,47 +176,53 @@ jobs:
           fi
 
   dockerfile-lint:
-    name: Dockerfile Best Practices Scan
+    name: Dockerfile Lint
+    needs: discover-dockerfiles
     runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        dockerfile: ${{ fromJson(needs.discover-dockerfiles.outputs.matrix) }}
     
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Run Trivy config scan on Dockerfiles
-        uses: aquasecurity/trivy-action@0.28.0
+      - name: Run Trivy config scan on Dockerfile
+        uses: aquasecurity/trivy-action@0.33.0
         with:
           scan-type: 'config'
-          scan-ref: '.'
+          scan-ref: ${{ matrix.dockerfile }}
           format: 'sarif'
-          output: 'trivy-dockerfile-scan.sarif'
+          output: 'trivy-config-${{ matrix.dockerfile }}.sarif'
           exit-code: '0'
       
-      - name: Upload Dockerfile scan results
+      - name: Upload Trivy config scan results
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: 'trivy-dockerfile-scan.sarif'
-          category: 'trivy-dockerfile-best-practices'
+          sarif_file: 'trivy-config-${{ matrix.dockerfile }}.sarif'
+          category: 'trivy-config-${{ matrix.dockerfile }}'
       
-      - name: Run Hadolint
+      - name: Run Hadolint on ${{ matrix.dockerfile }}
         uses: hadolint/hadolint-action@v3.1.0
         with:
-          dockerfile: '**/Dockerfile*'
+          dockerfile: ${{ matrix.dockerfile }}
           format: 'sarif'
-          output-file: 'hadolint-results.sarif'
+          output-file: 'hadolint-${{ matrix.dockerfile }}.sarif'
           no-fail: true
       
       - name: Upload Hadolint results
         uses: github/codeql-action/upload-sarif@v3
         if: always()
         with:
-          sarif_file: 'hadolint-results.sarif'
-          category: 'hadolint'
+          sarif_file: 'hadolint-${{ matrix.dockerfile }}.sarif'
+          category: 'hadolint-${{ matrix.dockerfile }}'
 
   security-summary:
-    name: Generate Security Summary
-    needs: [build-and-scan, fips-validation]
+    name: Security Summary
+    needs: [build-and-scan, fips-validation, dockerfile-lint]
     runs-on: ubuntu-latest
     if: always()
     
@@ -218,10 +234,11 @@ jobs:
       
       - name: Generate summary report
         run: |
-          echo "# FIPS Container Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "# 🔒 FIPS Container Security Scan Summary" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "**Scan Date:** $(date -u +'%Y-%m-%d %H:%M:%S UTC')" >> $GITHUB_STEP_SUMMARY
-          echo "**Workflow Run:** ${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Workflow Run:** #${{ github.run_number }}" >> $GITHUB_STEP_SUMMARY
+          echo "**Triggered by:** ${{ github.event_name }}" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           
           # Count total vulnerabilities across all images
@@ -229,9 +246,11 @@ jobs:
             TOTAL_CRITICAL=0
             TOTAL_HIGH=0
             TOTAL_MEDIUM=0
+            IMAGE_COUNT=0
             
             for json_file in scan-results/*/*.json; do
               if [ -f "$json_file" ]; then
+                IMAGE_COUNT=$((IMAGE_COUNT + 1))
                 CRITICAL=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="CRITICAL")] | length' "$json_file" || echo 0)
                 HIGH=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="HIGH")] | length' "$json_file" || echo 0)
                 MEDIUM=$(jq '[.Results[]?.Vulnerabilities[]? | select(.Severity=="MEDIUM")] | length' "$json_file" || echo 0)
@@ -242,14 +261,35 @@ jobs:
               fi
             done
             
-            echo "## Vulnerability Summary" >> $GITHUB_STEP_SUMMARY
+            echo "## 📊 Vulnerability Summary" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "**Images Scanned:** ${IMAGE_COUNT}" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
             echo "| Severity | Count |" >> $GITHUB_STEP_SUMMARY
             echo "|----------|-------|" >> $GITHUB_STEP_SUMMARY
             echo "| 🔴 CRITICAL | $TOTAL_CRITICAL |" >> $GITHUB_STEP_SUMMARY
             echo "| 🟠 HIGH | $TOTAL_HIGH |" >> $GITHUB_STEP_SUMMARY
             echo "| 🟡 MEDIUM | $TOTAL_MEDIUM |" >> $GITHUB_STEP_SUMMARY
+            
+            # Set job status based on findings
+            if [ "$TOTAL_CRITICAL" -gt 0 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **Action Required:** Critical vulnerabilities detected!" >> $GITHUB_STEP_SUMMARY
+            elif [ "$TOTAL_HIGH" -gt 0 ]; then
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "⚠️ **Warning:** High severity vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "" >> $GITHUB_STEP_SUMMARY
+              echo "✅ **Status:** No critical or high vulnerabilities detected" >> $GITHUB_STEP_SUMMARY
+            fi
+          else
+            echo "⚠️ No scan results found" >> $GITHUB_STEP_SUMMARY
           fi
           
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "📊 **View detailed results in the Security tab**" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📋 **View detailed results:**" >> $GITHUB_STEP_SUMMARY
+          echo "- [Security Tab](${{ github.server_url }}/${{ github.repository }}/security/code-scanning)" >> $GITHUB_STEP_SUMMARY
+          echo "- [Workflow Run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})" >> $GITHUB_STEP_SUMMARY
 
