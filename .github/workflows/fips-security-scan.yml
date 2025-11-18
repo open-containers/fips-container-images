@@ -35,7 +35,7 @@ jobs:
         id: set-matrix
         run: |
           # Find all Dockerfiles recursively
-          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.Dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
+          dockerfiles=$(find . -type f \( -name "Dockerfile*" -o -name "*.dockerfile" \) | jq -R -s -c 'split("\n")[:-1]')
           echo "matrix=${dockerfiles}" >> $GITHUB_OUTPUT
           echo "Found Dockerfiles: ${dockerfiles}"
           
@@ -67,30 +67,40 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
       
-      - name: Generate image name
-        id: image-name
+      - name: Generate image name and build context
+        id: image-info
         run: |
           # Create unique image name from dockerfile path (must be lowercase)
           DOCKERFILE_PATH="${{ matrix.dockerfile }}"
           IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g; s/^-//; s/.*/\L&/')
           echo "name=fips-${IMAGE_NAME}:latest" >> $GITHUB_OUTPUT
           echo "Building: fips-${IMAGE_NAME}:latest"
+          
+          # Extract directory and filename for build context
+          DOCKERFILE_DIR=$(dirname "${DOCKERFILE_PATH}")
+          DOCKERFILE_NAME=$(basename "${DOCKERFILE_PATH}")
+          echo "context=${DOCKERFILE_DIR}" >> $GITHUB_OUTPUT
+          echo "file=${DOCKERFILE_NAME}" >> $GITHUB_OUTPUT
+          echo "Build context: ${DOCKERFILE_DIR}"
+          echo "Dockerfile: ${DOCKERFILE_NAME}"
       
       - name: Build FIPS Docker Image
+        working-directory: ${{ steps.image-info.outputs.context }}
         run: |
           docker build \
-            --file "${{ matrix.dockerfile }}" \
-            --tag "${{ steps.image-name.outputs.name }}" \
+            --file "${{ steps.image-info.outputs.file }}" \
+            --tag "${{ steps.image-info.outputs.name }}" \
             --label "fips-compliant=true" \
             --label "built-by=github-actions" \
             --label "build-date=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" \
             --label "source-commit=${{ github.sha }}" \
+            --label "dockerfile-path=${{ matrix.dockerfile }}" \
             .
       
       - name: Run Trivy vulnerability scanner
         uses: aquasecurity/trivy-action@0.33.0
         with:
-          image-ref: ${{ steps.image-name.outputs.name }}
+          image-ref: ${{ steps.image-info.outputs.name }}
           format: 'sarif'
           output: 'trivy-results-${{ matrix.dockerfile }}.sarif'
           severity: 'CRITICAL,HIGH,MEDIUM'
@@ -103,13 +113,13 @@ jobs:
         if: always()
         with:
           sarif_file: 'trivy-results-${{ matrix.dockerfile }}.sarif'
-          category: 'trivy-${{ steps.image-name.outputs.name }}'
+          category: 'trivy-${{ steps.image-info.outputs.name }}'
       
       - name: Generate JSON report for artifacts
         uses: aquasecurity/trivy-action@0.33.0
         if: always()
         with:
-          image-ref: ${{ steps.image-name.outputs.name }}
+          image-ref: ${{ steps.image-info.outputs.name }}
           format: 'json'
           output: 'trivy-results-${{ matrix.dockerfile }}.json'
           severity: 'CRITICAL,HIGH,MEDIUM'
@@ -119,7 +129,7 @@ jobs:
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: trivy-scan-${{ steps.image-name.outputs.name }}
+          name: trivy-scan-${{ steps.image-info.outputs.name }}
           path: |
             trivy-results-${{ matrix.dockerfile }}.json
             trivy-results-${{ matrix.dockerfile }}.sarif
@@ -151,20 +161,33 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
       
-      - name: Build Image for FIPS Testing
+      - name: Prepare build context
+        id: build-prep
         run: |
           DOCKERFILE_PATH="${{ matrix.dockerfile }}"
           IMAGE_NAME=$(echo "${DOCKERFILE_PATH}" | sed 's/[\/\.]/-/g; s/^-//; s/.*/\L&/')
-          docker build -f "${{ matrix.dockerfile }}" -t "fips-${IMAGE_NAME}:test" .
-          echo "IMAGE_NAME=fips-${IMAGE_NAME}:test" >> $GITHUB_ENV
-          echo "Building image: fips-${IMAGE_NAME}:test"
+          echo "image=fips-${IMAGE_NAME}:test" >> $GITHUB_OUTPUT
+          
+          DOCKERFILE_DIR=$(dirname "${DOCKERFILE_PATH}")
+          DOCKERFILE_NAME=$(basename "${DOCKERFILE_PATH}")
+          echo "context=${DOCKERFILE_DIR}" >> $GITHUB_OUTPUT
+          echo "file=${DOCKERFILE_NAME}" >> $GITHUB_OUTPUT
+      
+      - name: Build Image for FIPS Testing
+        working-directory: ${{ steps.build-prep.outputs.context }}
+        run: |
+          docker build \
+            --file "${{ steps.build-prep.outputs.file }}" \
+            --tag "${{ steps.build-prep.outputs.image }}" \
+            .
+          echo "Building image: ${{ steps.build-prep.outputs.image }}"
       
       - name: Verify FIPS Module Installation
         run: |
           echo "Checking for FIPS cryptographic modules..."
           
           # Check for OpenSSL FIPS provider
-          docker run --rm "${{ env.IMAGE_NAME }}" sh -c "
+          docker run --rm "${{ steps.build-prep.outputs.image }}" sh -c "
             if command -v openssl >/dev/null 2>&1; then
               echo '=== OpenSSL Version ==='
               openssl version -a
