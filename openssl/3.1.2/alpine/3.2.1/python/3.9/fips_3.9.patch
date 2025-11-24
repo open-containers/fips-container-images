@@ -1,0 +1,60 @@
+From <generated-commit-id> Mon Sep 17 00:00:00 2001
+From: <Your Name>
+Date: Thu, 06 Mar 2025 12:00:00 +0000
+Subject: [PATCH] Port gh-118224: Load default OpenSSL provider for nonsecurity algorithms to Python 3.9
+
+When OpenSSL is configured to only load "base+fips" providers into the
+Null library context, md5 might not be available. This change ensures
+the "default" provider is loaded to access nonsecurity hashes instead
+of falling back to internal hashlib implementations, aligning with
+FIPS compliance requirements.
+---
+ Modules/_hashopenssl.c | 14 ++++++++++++++
+ 1 file changed, 14 insertions(+)
+
+diff --git a/Modules/_hashopenssl.c b/Modules/_hashopenssl.c
+index 7f8b9c4..e2d5f7e 100644
+--- a/Modules/_hashopenssl.c
++++ b/Modules/_hashopenssl.c
+@@ -50,6 +50,7 @@
+ #endif
+
+ #if OPENSSL_VERSION_NUMBER >= 0x30000000L
++#include <openssl/provider.h>
+ #define PY_EVP_MD EVP_MD
+ #define PY_EVP_MD_fetch(algorithm, properties) EVP_MD_fetch(NULL, algorithm, properties)
+ #define PY_EVP_MD_up_ref(md) EVP_MD_up_ref(md)
+@@ -247,6 +248,17 @@ typedef struct {
+     _Py_hashtable_t *hashtable;
+ } _hashlibstate;
+
++static void try_load_default_provider(void) {
++#if OPENSSL_VERSION_NUMBER >= 0x30000000L
++    /* Load the default config file, and expected providers */
++    OPENSSL_init_crypto(OPENSSL_INIT_LOAD_CONFIG, NULL);
++    if (!OSSL_PROVIDER_available(NULL, "default")) {
++       /* System is configured without the default provider */
++        OSSL_PROVIDER_load(NULL, "default");
++    }
++#endif
++}
++
+ static inline _hashlibstate*
+ get_hashlib_state(PyObject *module)
+ {
+@@ -368,6 +380,7 @@ py_digest_by_name(PyObject *module, const char *name, enum Py_hash_type py_ht)
+             break;
+         case Py_ht_evp_nosecurity:
+             if (entry->evp_nosecurity == NULL) {
++                try_load_default_provider();
+                 entry->evp_nosecurity = PY_EVP_MD_fetch(entry->ossl_name, "-fips");
+             }
+             digest = entry->evp_nosecurity;
+@@ -385,6 +398,7 @@ py_digest_by_name(PyObject *module, const char *name, enum Py_hash_type py_ht)
+             digest = PY_EVP_MD_fetch(name, NULL);
+             break;
+         case Py_ht_evp_nosecurity:
++            try_load_default_provider();
+             digest = PY_EVP_MD_fetch(name, "-fips");
+             break;
+         }
