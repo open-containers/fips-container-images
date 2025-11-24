@@ -1,0 +1,177 @@
+# ============================================================================
+# build-config.yaml - Configuration file for automated builds
+# ============================================================================
+
+# Environment-specific configurations
+environments:
+  development:
+    base_image: "cgr.dev/chainguard/wolfi-base:latest"
+    python_version: "3.9.19"
+    openssl_version: "3.1.2"
+    optimize: "--enable-optimizations"
+    make_jobs: "4"
+    
+  production:
+    base_image: "cgr.dev/chainguard/wolfi-base:latest"
+    python_version: "3.9.19"
+    openssl_version: "3.1.2"
+    optimize: "--enable-optimizations"
+    make_jobs: "$(nproc)"
+    
+  testing:
+    base_image: "cgr.dev/chainguard/wolfi-base:latest"
+    python_version: "3.9.19"
+    openssl_version: "3.1.2"
+    optimize: ""
+    make_jobs: "2"
+
+# Version matrix for multi-version builds
+version_matrix:
+  python:
+    - "3.9.19"
+    - "3.10.14"
+    - "3.11.9"
+  openssl:
+    - "3.1.2"
+    - "3.0.9"
+
+# Common settings
+common:
+  paths:
+    openssl_prefix: "/usr/local/ssl"
+    python_prefix: "/opt/python-fips"
+    build_dir: "/build"
+    app_dir: "/app"
+  
+  user:
+    name: "appuser"
+    group: "appuser"
+    uid: 1001
+    gid: 1001
+  
+  urls:
+    python: "https://www.python.org/ftp/python"
+    openssl: "https://www.openssl.org/source"
+  
+  packages:
+    build:
+      - build-base
+      - ca-certificates
+      - wget
+      - patch
+      - perl
+      - bzip2-dev
+      - libffi-dev
+      - ncurses-dev
+      - readline-dev
+      - sqlite-dev
+      - xz-dev
+      - zlib-dev
+      - gdbm-dev
+      - linux-headers
+    
+    runtime:
+      - ca-certificates
+      - glibc
+      - libgcc
+      - libffi
+      - zlib
+      - bzip2
+      - xz
+      - readline
+      - sqlite-libs
+      - ncurses
+      - gdbm
+
+# Architecture-specific settings
+architectures:
+  x86_64:
+    openssl_arch: "linux-x86_64"
+  aarch64:
+    openssl_arch: "linux-aarch64"
+  arm:
+    openssl_arch: "linux-armv4"
+
+---
+# ============================================================================
+# build.sh - Automated build script
+# ============================================================================
+#!/bin/bash
+
+set -euo pipefail
+
+# Default values
+ENV=${ENV:-"development"}
+PYTHON_VERSION=${PYTHON_VERSION:-"3.9.19"}
+OPENSSL_VERSION=${OPENSSL_VERSION:-"3.1.2"}
+PATCH_FILE=${PATCH_FILE:-"fips_3.9.patch"}
+ARCH=${ARCH:-"x86_64"}
+TAG=${TAG:-"latest"}
+
+# Parse YAML config (requires yq)
+if command -v yq &> /dev/null; then
+    BASE_IMAGE=$(yq eval ".environments.${ENV}.base_image" build-config.yaml)
+    OPTIMIZE=$(yq eval ".environments.${ENV}.optimize" build-config.yaml)
+    MAKE_JOBS=$(yq eval ".environments.${ENV}.make_jobs" build-config.yaml)
+    OPENSSL_ARCH=$(yq eval ".architectures.${ARCH}.openssl_arch" build-config.yaml)
+else
+    echo "Warning: yq not found, using default values"
+    BASE_IMAGE="cgr.dev/chainguard/wolfi-base:latest"
+    OPTIMIZE="--enable-optimizations"
+    MAKE_JOBS="$(nproc)"
+    OPENSSL_ARCH="linux-x86_64"
+fi
+
+# Build the Docker image
+echo "Building FIPS Python Docker image..."
+echo "Environment: ${ENV}"
+echo "Python: ${PYTHON_VERSION}"
+echo "OpenSSL: ${OPENSSL_VERSION}"
+echo "Architecture: ${ARCH}"
+
+docker build \
+    --build-arg BASE_IMAGE="${BASE_IMAGE}" \
+    --build-arg PYTHON_VERSION="${PYTHON_VERSION}" \
+    --build-arg OPENSSL_FIPS_VERSION="${OPENSSL_VERSION}" \
+    --build-arg PATCH_FILE="${PATCH_FILE}" \
+    --build-arg OPENSSL_ARCH="${OPENSSL_ARCH}" \
+    --build-arg MAKE_JOBS="${MAKE_JOBS}" \
+    --build-arg PYTHON_OPTIMIZE="${OPTIMIZE}" \
+    --tag "python-fips:${PYTHON_VERSION}-${TAG}" \
+    --tag "python-fips:${TAG}" \
+    .
+
+echo "Build completed successfully!"
+
+---
+# ============================================================================
+# .env.example - Environment variables template
+# ============================================================================
+
+# Build Environment
+ENV=development
+
+# Version Configuration
+PYTHON_VERSION=3.9.19
+OPENSSL_VERSION=3.1.2
+PATCH_FILE=fips_3.9.patch
+
+# Architecture
+ARCH=x86_64
+
+# Image Tag
+TAG=latest
+
+# Advanced Options
+PYTHON_OPTIMIZE=--enable-optimizations
+MAKE_JOBS=4
+
+# Custom Paths (optional)
+# OPENSSL_PREFIX=/usr/local/ssl
+# PYTHON_PREFIX=/opt/python-fips
+# APP_DIR=/app
+
+# User Configuration (optional)
+# APP_USER=appuser
+# APP_UID=1001
+# APP_GID=1001
