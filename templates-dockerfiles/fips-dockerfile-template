@@ -1,0 +1,205 @@
+# ============================================================================
+# Templatized FIPS-Enabled Python Dockerfile
+# ============================================================================
+
+# --- Base Configuration ---
+ARG BASE_IMAGE="cgr.dev/chainguard/wolfi-base:latest"
+
+# --- Version Configuration ---
+ARG PYTHON_VERSION="3.9.19"
+ARG OPENSSL_FIPS_VERSION="3.1.2"
+ARG PATCH_FILE="fips_3.9.patch"
+
+# --- Path Configuration ---
+ARG OPENSSL_PREFIX="/usr/local/ssl"
+ARG PYTHON_PREFIX="/opt/python-fips"
+ARG BUILD_DIR="/build"
+ARG APP_DIR="/app"
+
+# --- Build Configuration ---
+ARG OPENSSL_ARCH="linux-x86_64"
+ARG MAKE_JOBS=""
+ARG PYTHON_OPTIMIZE="--enable-optimizations"
+
+# --- User Configuration ---
+ARG APP_USER="appuser"
+ARG APP_GROUP="appuser"
+ARG APP_UID="1001"
+ARG APP_GID="1001"
+
+# --- Download URLs ---
+ARG PYTHON_DOWNLOAD_URL="https://www.python.org/ftp/python"
+ARG OPENSSL_DOWNLOAD_URL="https://www.openssl.org/source"
+
+# --- Package Lists ---
+ARG BUILD_PACKAGES="build-base ca-certificates wget patch perl bzip2-dev libffi-dev ncurses-dev readline-dev sqlite-dev xz-dev zlib-dev gdbm-dev linux-headers"
+ARG RUNTIME_PACKAGES="ca-certificates glibc libgcc libffi zlib bzip2 xz readline sqlite-libs ncurses gdbm"
+
+# ============================================================================
+# Build Stage - Compile FIPS-enabled OpenSSL and Python
+# ============================================================================
+FROM ${BASE_IMAGE} AS build
+
+ARG PYTHON_VERSION
+ARG OPENSSL_FIPS_VERSION
+ARG PATCH_FILE
+ARG OPENSSL_PREFIX
+ARG PYTHON_PREFIX
+ARG BUILD_DIR
+ARG OPENSSL_ARCH
+ARG MAKE_JOBS
+ARG PYTHON_OPTIMIZE
+ARG PYTHON_DOWNLOAD_URL
+ARG OPENSSL_DOWNLOAD_URL
+ARG BUILD_PACKAGES
+
+WORKDIR ${BUILD_DIR}
+
+# Install build dependencies
+RUN apk add --no-cache ${BUILD_PACKAGES}
+
+# Download and patch Python
+COPY ${PATCH_FILE} fips.patch
+RUN wget ${PYTHON_DOWNLOAD_URL}/${PYTHON_VERSION}/Python-${PYTHON_VERSION}.tgz \
+    && tar -xzf Python-${PYTHON_VERSION}.tgz \
+    && cd Python-${PYTHON_VERSION} \
+    && patch -p1 < ../fips.patch \
+    && cd ..
+
+# Build FIPS-enabled OpenSSL
+RUN wget ${OPENSSL_DOWNLOAD_URL}/openssl-${OPENSSL_FIPS_VERSION}.tar.gz \
+    && tar -xzf openssl-${OPENSSL_FIPS_VERSION}.tar.gz \
+    && cd openssl-${OPENSSL_FIPS_VERSION} \
+    && ./Configure ${OPENSSL_ARCH} \
+        --prefix=${OPENSSL_PREFIX} \
+        --openssldir=${OPENSSL_PREFIX} \
+        --libdir=${OPENSSL_PREFIX}/lib \
+        shared \
+        enable-fips \
+    && make depend \
+    && make ${MAKE_JOBS:+-j${MAKE_JOBS}} \
+    && make install \
+    && echo "${OPENSSL_PREFIX}/lib" > /etc/ld.so.conf.d/openssl-${OPENSSL_FIPS_VERSION}.conf \
+    && ldconfig -v \
+    && ${OPENSSL_PREFIX}/bin/openssl fipsinstall \
+        -out ${OPENSSL_PREFIX}/fipsmodule.cnf \
+        -module ${OPENSSL_PREFIX}/lib/ossl-modules/fips.so \
+    && cd .. \
+    && rm -rf openssl-${OPENSSL_FIPS_VERSION}.tar.gz openssl-${OPENSSL_FIPS_VERSION}
+
+# Configure OpenSSL for FIPS mode
+RUN echo "openssl_conf = openssl_init\n\
+\n\
+.include ${OPENSSL_PREFIX}/fipsmodule.cnf\n\
+\n\
+[openssl_init]\n\
+providers = provider_sect\n\
+alg_section = algorithm_sect\n\
+\n\
+[provider_sect]\n\
+fips = fips_sect\n\
+base = base_sect\n\
+\n\
+[base_sect]\n\
+activate = 1\n\
+\n\
+[algorithm_sect]\n\
+default_properties = fips=yes\n\
+" > ${OPENSSL_PREFIX}/openssl.cnf
+
+# Build Python with FIPS-enabled OpenSSL
+RUN cd Python-${PYTHON_VERSION} \
+    && LDFLAGS="-L${OPENSSL_PREFIX}/lib -L${OPENSSL_PREFIX}/lib64 -Wl,-rpath=${PYTHON_PREFIX}/lib -Wl,-rpath=${OPENSSL_PREFIX}/lib" \
+       LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib:${OPENSSL_PREFIX}/lib64" \
+       CPPFLAGS="-I${OPENSSL_PREFIX}/include" \
+       CFLAGS="-I${OPENSSL_PREFIX}/include" \
+       PKG_CONFIG_PATH="${OPENSSL_PREFIX}/lib/pkgconfig" \
+       ./configure \
+        --enable-shared \
+        ${PYTHON_OPTIMIZE} \
+        --with-builtin-hashlib-hashes=blake2 \
+        --prefix=${PYTHON_PREFIX} \
+        --with-openssl=${OPENSSL_PREFIX} \
+        --with-openssl-rpath=${OPENSSL_PREFIX}/lib \
+        --with-ssl-default-suites=openssl \
+        --without-ensurepip \
+    && LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib:${OPENSSL_PREFIX}/lib64" make ${MAKE_JOBS:+-j${MAKE_JOBS}} \
+    && make install \
+    && echo "${PYTHON_PREFIX}/lib" > /etc/ld.so.conf.d/python-fips.conf \
+    && ldconfig -v \
+    && cd .. \
+    && rm -rf Python-${PYTHON_VERSION}
+
+# Verify SSL module is available
+RUN LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib:${PYTHON_PREFIX}/lib" \
+    ${PYTHON_PREFIX}/bin/python3.9 -c "import ssl; print('SSL module loaded successfully')"
+
+# Install pip and cryptography with FIPS support
+RUN LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib:${PYTHON_PREFIX}/lib" \
+    ${PYTHON_PREFIX}/bin/python3.9 -m ensurepip \
+    && LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib:${PYTHON_PREFIX}/lib" \
+       ${PYTHON_PREFIX}/bin/python3.9 -m pip install --no-cache-dir wheel \
+    && LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib:${PYTHON_PREFIX}/lib" \
+       ${PYTHON_PREFIX}/bin/python3.9 -m pip install --no-cache-dir --upgrade pip setuptools \
+    && CRYPTOGRAPHY_DONT_BUILD_RUST=1 \
+       CFLAGS="-I${OPENSSL_PREFIX}/include" \
+       LDFLAGS="-L${OPENSSL_PREFIX}/lib" \
+       LD_LIBRARY_PATH="${OPENSSL_PREFIX}/lib:${PYTHON_PREFIX}/lib" \
+       ${PYTHON_PREFIX}/bin/python3.9 -m pip install --no-cache-dir cryptography \
+    && ln -sf ${PYTHON_PREFIX}/bin/pip3.9 ${PYTHON_PREFIX}/bin/pip
+
+# Strip binaries and remove unnecessary files
+RUN find ${PYTHON_PREFIX} -depth \
+    \( -name 'test' -o -name 'tests' -o -name '*.pyc' -o -name '*.pyo' \
+       -o -name 'idlelib' -o -name 'tkinter' -o -name '__pycache__' \) \
+    -exec rm -rf {} + \
+    && strip --strip-unneeded ${OPENSSL_PREFIX}/bin/openssl ${PYTHON_PREFIX}/bin/python3.9 2>/dev/null || true
+
+# ============================================================================
+# Final Stage - Minimal runtime
+# ============================================================================
+FROM ${BASE_IMAGE}
+
+ARG OPENSSL_FIPS_VERSION
+ARG OPENSSL_PREFIX
+ARG PYTHON_PREFIX
+ARG APP_DIR
+ARG APP_USER
+ARG APP_GROUP
+ARG APP_UID
+ARG APP_GID
+ARG RUNTIME_PACKAGES
+
+# Install only runtime dependencies
+RUN apk add --no-cache ${RUNTIME_PACKAGES}
+
+# Copy compiled OpenSSL and Python from build stage
+COPY --from=build ${OPENSSL_PREFIX} ${OPENSSL_PREFIX}
+COPY --from=build ${PYTHON_PREFIX} ${PYTHON_PREFIX}
+COPY --from=build /etc/ld.so.conf.d/openssl-${OPENSSL_FIPS_VERSION}.conf /etc/ld.so.conf.d/openssl-fips.conf
+COPY --from=build /etc/ld.so.conf.d/python-fips.conf /etc/ld.so.conf.d/python-fips.conf
+
+# Configure library paths and symlinks
+RUN ldconfig \
+    && ln -sf ${OPENSSL_PREFIX}/bin/openssl /usr/bin/openssl \
+    && ln -sf ${PYTHON_PREFIX}/bin/python3.9 /usr/bin/python3 \
+    && ln -sf ${PYTHON_PREFIX}/bin/python3.9 /usr/bin/python \
+    && ln -sf ${PYTHON_PREFIX}/bin/pip3.9 ${PYTHON_PREFIX}/bin/pip
+
+# Create non-root user and app directory
+RUN addgroup -g ${APP_GID} ${APP_GROUP} \
+    && adduser -D -u ${APP_UID} -G ${APP_GROUP} ${APP_USER} \
+    && mkdir -p ${APP_DIR} \
+    && chown -R ${APP_USER}:${APP_GROUP} ${APP_DIR}
+
+WORKDIR ${APP_DIR}
+
+# Set environment variables
+ENV PATH=${PYTHON_PREFIX}/bin:$PATH \
+    OPENSSL_CONF=${OPENSSL_PREFIX}/openssl.cnf \
+    OPENSSL_FIPS=1 \
+    LD_LIBRARY_PATH=${OPENSSL_PREFIX}/lib:${PYTHON_PREFIX}/lib
+
+USER ${APP_USER}
+
+CMD ["python3"]%
