@@ -1,76 +1,101 @@
-### This repo will be used to build and maintain FIPS enabled container images only.
+# FIPS Container Images
+FIPS Container Images is a community-driven library of OCI-compatible container images that are built, tested, and documented for use in FIPS 140-2 and FIPS 140-3 regulated environments. The goal is to give platform, security, and application teams a consistent way to consume FIPS-capable base images without having to reverse-engineer each vendor’s cryptographic story.
 
+## Why this project exists
+Running in a FIPS-regulated environment is more than just “turning on FIPS mode” inside a container. Teams need clear provenance, repeatable builds, and audit-ready documentation of which cryptographic modules are present, how they are configured, and how images are kept patched over time.
 
-#### Roadmap for supporting languages, tools, frameworks, etc:
+This project focuses on:
 
-- Python
-- Nodejs
-- Go
-- Rust
-- Java
-- .NET
-- C
-- C++
-- vLLM 
+- Curated base images with FIPS-validated crypto modules (for example OpenSSL FIPS provider and Java FIPS providers where available)
+- Opinionated Dockerfiles and build scripts that enable FIPS mode correctly per language/runtime.
+- Attestations and SBOMs that make audits and security reviews easier.
 
+> **Important:** Using a FIPS-capable image does not, by itself, make your system FIPS compliant. Correct integration, host configuration, and operational controls are still required.
 
-#### Roadmap for supporting languages, tools, frameworks, etc:
+## Supported stacks
 
-- Ubuntu
-- Wolfi Linux
-- Debian
-- Red Hat (maybe later)
-- 
+Planned language/runtime support:
 
-# 
-> FIPS Compliance Overview
+- Python  
+- Node.js  
+- Go  
+- Rust  
+- Java  
+- .NET  
+- C / C++  
+- vLLM and other ML/LLM runtimes
 
-    FIPS (Federal Information Processing Standards) compliance ensures that cryptographic modules and algorithms used in software meet rigorous U.S. government security standards for protecting sensitive data, such as those required by FedRAMP and other regulated environments.
+Planned base operating systems:
 
-    ​Key Requirements for FIPS-Compliant Docker Images
+- Ubuntu (FIPS / Ubuntu Pro)  
+- Wolfi Linux  
+- Debian  
+- Red Hat family (RHEL/UBI, later)
 
-        Images must use cryptographic modules that are fully validated under FIPS 140-2 or FIPS 140-3 (such as OpenSSL FIPS Provider or Bouncy Castle for Java).
-    ​
-    Avoid deprecated or insecure algorithms such as MD5, and use only approved ones (e.g., AES, SHA-2 family).
+## Project goals
 
-    ​Application code and dependencies should be built and configured to utilize FIPS-validated modules exclusively.
+This repository aims to:
 
-    Documentation and signed attestations must be available to demonstrate the compliance status, including links to NIST CMVP certificates and information on the actual cryptographic components present in the image.
+- Provide **minimal, auditable base images** for building FIPS-aware application containers.
+- Demonstrate **reference Dockerfiles** for each language/runtime that correctly link against FIPS-validated crypto modules.  
+- Supply **attestation artifacts** (SBOMs, FIPS module lists, certificate references) alongside published images.
+- Integrate with **CI security scanning** to keep images as close to “near-zero known CVEs” as practical.
 
-        ​
-    Building FIPS-Compliant Docker Images
+## Quick start
 
-        Choose a base image that is already FIPS-enabled or validated, or manually integrate FIPS-validated cryptographic modules.
+> The exact registry name, tags, and paths will depend on where you decide to publish (GitHub Container Registry, Docker Hub, etc.). Update examples once you have real tags.
 
-        Ensure critical software (application runtimes, libraries) are compiled against or configured for FIPS mode.
+### 1. Pull a base image
+docker pull ghcr.io/open-containers/python-fips:3.12-ubuntu20.04
 
-        Run validation or self-test utilities (such as fipsinstall for OpenSSL) per-container to confirm FIPS mode is active.
+### 2. Build your app on top
+FROM ghcr.io/open-containers/python-fips:3.12-ubuntu20.04
+Copy application code
 
-    ​
-    Regularly scan images for CVEs and non-FIPS-approved cryptographic libraries, updating modules as necessary to maintain compliance.
+WORKDIR /app
+COPY . .
+Install dependencies as needed
 
-    ​Attach any available official attestations or compliance documentation to images, and prepare them for audit readiness.
+RUN pip install --no-cache-dir -r requirements.txt
 
-    Verification and Audit Evidence
+CMD ["python", "main.py"]
 
-        Provide attestation files that list every FIPS-validated module, including NIST CMVP certificate numbers and expiration dates.
+### 3. Verify FIPS mode inside the container
 
-        Use container security scanning tools to confirm absence of non-compliant modules.
+Each base image ships with a small verification helper or documented command sequence to confirm that FIPS mode is active (for example using `openssl list -providers` or equivalent).
 
-        Maintain signed audit records and supply evidence of the secure build and deployment processes.
+## FIPS scope and limitations
 
-    Limitations and Responsibilities
+This project focuses on:
 
-    Using a FIPS-compliant image does not guarantee full compliance; it also depends on correct integration and deployment practices in broader orchestrations such as Kubernetes and host configurations.
-​
+- Containers and their **cryptographic modules**, not on host kernel or hardware-level validation.
+- Referencing **NIST CMVP certificates** where available, not issuing new certifications.
 
+Consumers of these images are responsible for:
 
-# License: 
-- Apache 2.0 
+- Ensuring the underlying host OS, kernel, and hardware meet their compliance requirements.  
+- Running containers only on approved platforms and configuring Kubernetes / orchestration layers accordingly.
 
-# Maintainers:
-- @mannec24
-- @devopstoday11 
+## Roadmap
 
+A high-level roadmap is maintained in [ROADMAP.md](./ROADMAP.md).
+Community feedback and real-world requirements from FedRAMP, DoD, and other regulated environments are especially welcome.
 
-## Announcements Tracking: 
+## Contributing
+
+Contributions are very welcome, especially in the following areas:
+
+- New language/runtime stacks (for example additional Python or JVM variants).
+- Additional base OS variants (for example STIG-hardened, CIS-hardened, or vendor-specific FIPS images).
+- CI improvements, scanners, and policy as code.
+
+See [CONTRIBUTING.md](./CONTRIBUTING.md) and [SECURITY.md](./SECURITY.md) before opening a pull request.
+
+## Maintainers
+
+- @mannec24  
+- @devopstoday11
+
+## License
+
+This project is licensed under the [Apache 2.0 License](./LICENSE).  
