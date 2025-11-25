@@ -46,19 +46,27 @@ This repository aims to:
 > The exact registry name, tags, and paths will depend on where you decide to publish (GitHub Container Registry, Docker Hub, etc.). Update examples once you have real tags.
 
 ### 1. Pull a base image
+
+```bash
 docker pull ghcr.io/open-containers/python-fips:3.12-ubuntu20.04
+```
 
 ### 2. Build your app on top
+
+```bash
 FROM ghcr.io/open-containers/python-fips:3.12-ubuntu20.04
-Copy application code
+
+#Copy application code
 
 WORKDIR /app
 COPY . .
-Install dependencies as needed
+
+#Install dependencies as needed
 
 RUN pip install --no-cache-dir -r requirements.txt
 
 CMD ["python", "main.py"]
+```
 
 ### 3. Verify FIPS mode inside the container
 
