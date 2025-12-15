@@ -1,0 +1,73 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build All Docker Images",
+      "type": "shell",
+      "command": "find . -name 'fips-dockerfile' -exec dirname {} \\; | while read dir; do echo \"Building $dir\" && docker build -f \"$dir/fips-dockerfile\" -t \"fips-$(basename $dir)\" \"$dir\"; done",
+      "problemMatcher": [],
+      "group": {
+        "kind": "build",
+        "isDefault": false
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Run FIPS Validation",
+      "type": "shell",
+      "command": "${input:validationScript}",
+      "problemMatcher": [],
+      "group": {
+        "kind": "test",
+        "isDefault": true
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "dedicated"
+      }
+    },
+    {
+      "label": "Check Shell Scripts",
+      "type": "shell",
+      "command": "find . -name '*.sh' -type f -exec shellcheck {} +",
+      "problemMatcher": [],
+      "group": {
+        "kind": "test",
+        "isDefault": false
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    },
+    {
+      "label": "Lint YAML Files",
+      "type": "shell",
+      "command": "yamllint .github/workflows/",
+      "problemMatcher": [],
+      "group": {
+        "kind": "test",
+        "isDefault": false
+      },
+      "presentation": {
+        "reveal": "always",
+        "panel": "shared"
+      }
+    }
+  ],
+  "inputs": [
+    {
+      "id": "validationScript",
+      "type": "pickString",
+      "description": "Select validation script to run",
+      "options": [
+        "tests/python/chk-fips-python-imgs.sh",
+        "tests/vllm/chk-fips-vllm-img.sh"
+      ],
+      "default": "tests/python/chk-fips-python-imgs.sh"
+    }
+  ]
+}
