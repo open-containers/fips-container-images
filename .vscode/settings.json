@@ -112,6 +112,9 @@
   "markdown.extension.toc.orderedList": false,
   "markdown.extension.toc.updateOnSave": true,
 
+  // Mermaid Settings
+  "markdown.mermaid.theme": "default",  // or "dark", "forest", "neutral"
+  
   // Git Settings
   "git.autofetch": true,
   "git.confirmSync": false,
