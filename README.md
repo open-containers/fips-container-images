@@ -6,11 +6,11 @@ Running in a FIPS-regulated environment is more than just “turning on FIPS mod
 
 This project focuses on:
 
-- Curated base images with FIPS-validated crypto modules (for example OpenSSL FIPS provider and Java FIPS providers where available)
+- Curated base images with FIPS-validated crypto modules (for example, OpenSSL FIPS provider and Java FIPS providers where available)
 - Opinionated Dockerfiles and build scripts that enable FIPS mode correctly per language/runtime.
 - Attestations and SBOMs that make audits and security reviews easier.
 
-> **Important:** Using a FIPS-capable image does not, by itself, make your system FIPS compliant. Correct integration, host configuration, and operational controls are still required.
+> **Important:** Using a FIPS-enabled image does not, by itself, make your system FIPS compliant. Correct integration, host configuration, and operational controls are still required.
 
 ## Supported stacks
 
@@ -70,7 +70,7 @@ CMD ["python", "main.py"]
 
 ### 3. Verify FIPS mode inside the container
 
-Each base image ships with a small verification helper or documented command sequence to confirm that FIPS mode is active (for example using `openssl list -providers` or equivalent).
+Each base image ships with a small verification helper or documented command sequence to confirm that FIPS mode is active (for example, using `openssl list -providers` or equivalent).
 
 ## FIPS scope and limitations
 
@@ -93,8 +93,8 @@ Community feedback and real-world requirements from FedRAMP, DoD, and other regu
 
 Contributions are very welcome, especially in the following areas:
 
-- New language/runtime stacks (for example additional Python or JVM variants).
-- Additional base OS variants (for example STIG-hardened, CIS-hardened, or vendor-specific FIPS images).
+- New language/runtime stacks (for example, additional Python or JVM variants).
+- Additional base OS variants (for example, STIG-hardened, CIS-hardened, or vendor-specific FIPS images).
 - CI improvements, scanners, and policy as code.
 
 See [CONTRIBUTING.md](./CONTRIBUTING.md) and [SECURITY.md](./SECURITY.md) before opening a pull request.
