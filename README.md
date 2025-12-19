@@ -1,6 +1,6 @@
 # FIPS Container Images
 
-> **Building the missing foundation for FIPS-compliant containerized applications**
+> **Building the FIPS-enabled containerized applications. This repo is always going to be open, and we appreciate the community contributions. We have major plans to add FIPS-enabled container images (dockerfiles) and then build auto-maintenance github actions to keep releasing the images with all the Software Supply Chain Security best practices, per [openSSF](https://openssf.org/) **
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](./LICENSE)
 [![Project Status](https://img.shields.io/badge/Status-Alpha-yellow.svg)](https://github.com/open-containers/fips-container-images)
