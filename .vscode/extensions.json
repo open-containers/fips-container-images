@@ -1,0 +1,39 @@
+{
+  "recommendations": [
+    // Docker Support
+    "ms-azuretools.vscode-docker",
+
+    // YAML Support (GitHub Actions)
+    "redhat.vscode-yaml",
+
+    // Shell Script Support
+    "foxundermoon.shell-format",
+    "timonwong.shellcheck",
+
+    // Markdown Support
+    "yzhang.markdown-all-in-one",
+    "davidanson.vscode-markdownlint",
+    "bierner.markdown-mermaid",
+
+    // Git Support
+    "eamodio.gitlens",
+    "mhutchie.git-graph",
+
+    // EditorConfig Support
+    "editorconfig.editorconfig",
+
+    // General Utilities
+    "streetsidesoftware.code-spell-checker",
+    "gruntfuggly.todo-tree",
+    "aaron-bond.better-comments"
+  ],
+
+  "unwantedRecommendations": [
+    "ms-python.python",
+    "ms-vscode.cpptools",
+    "golang.go",
+    "rust-lang.rust-analyzer",
+    "dbaeumer.vscode-eslint",
+    "esbenp.prettier-vscode"
+  ]
+}

@@ -1,0 +1,142 @@
+{
+  // Editor Settings
+  "editor.formatOnSave": true,
+  "editor.tabSize": 2,
+  "editor.insertSpaces": true,
+  "editor.detectIndentation": true,
+  "editor.rulers": [80, 120],
+  "editor.wordWrap": "on",
+  "editor.renderWhitespace": "boundary",
+  "editor.trimAutoWhitespace": true,
+  "files.trimTrailingWhitespace": true,
+  "files.insertFinalNewline": true,
+  "files.trimFinalNewlines": true,
+
+  // File Associations
+  "files.associations": {
+    "**/fips-dockerfile*": "dockerfile",
+    "*.Dockerfile": "dockerfile",
+    "Dockerfile*": "dockerfile",
+    "*.yml": "yaml",
+    "*.yaml": "yaml"
+  },
+
+  // Files to Exclude from Explorer
+  "files.exclude": {
+    "**/.git": true,
+    "**/.DS_Store": true,
+    "**/node_modules": true,
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+
+  // Search Exclude Patterns
+  "search.exclude": {
+    "**/.git": true,
+    "**/node_modules": true,
+    "**/__pycache__": true,
+    "**/*.pyc": true
+  },
+
+  // Language-Specific Settings
+
+  // Dockerfile
+  "[dockerfile]": {
+    "editor.defaultFormatter": "ms-azuretools.vscode-docker",
+    "editor.tabSize": 2,
+    "editor.quickSuggestions": {
+      "strings": true
+    }
+  },
+
+  // YAML (GitHub Actions workflows)
+  "[yaml]": {
+    "editor.defaultFormatter": "redhat.vscode-yaml",
+    "editor.tabSize": 2,
+    "editor.autoIndent": "advanced"
+  },
+
+  // Shell Scripts
+  "[shellscript]": {
+    "editor.defaultFormatter": "foxundermoon.shell-format",
+    "editor.tabSize": 2,
+    "files.eol": "\n"
+  },
+
+  // Markdown
+  "[markdown]": {
+    "editor.defaultFormatter": "yzhang.markdown-all-in-one",
+    "editor.wordWrap": "on",
+    "editor.quickSuggestions": {
+      "other": "on",
+      "comments": "off",
+      "strings": "off"
+    }
+  },
+
+  // Docker Extension Settings
+  "docker.dockerPath": "docker",
+  "docker.enableDockerComposeLanguageService": false,
+  "docker.languageserver.diagnostics.deprecatedMaintainer": "warning",
+  "docker.languageserver.diagnostics.emptyContinuationLine": "warning",
+  "docker.languageserver.diagnostics.instructionCasing": "warning",
+
+  // YAML Extension Settings
+  "yaml.schemas": {
+    "https://json.schemastore.org/github-workflow.json": [
+      ".github/workflows/*.yml",
+      ".github/workflows/*.yaml"
+    ]
+  },
+  "yaml.format.enable": true,
+  "yaml.format.singleQuote": false,
+  "yaml.format.bracketSpacing": true,
+  "yaml.validate": true,
+  "yaml.completion": true,
+  "yaml.hover": true,
+
+  // ShellCheck Settings
+  "shellcheck.enable": true,
+  "shellcheck.enableQuickFix": true,
+  "shellcheck.run": "onType",
+  "shellcheck.exclude": [],
+  "shellcheck.customArgs": [],
+
+  // Shell Format Settings
+  "shellformat.flag": "-i 2 -ci -sr",
+
+  // Markdown Settings
+  "markdown.preview.breaks": true,
+  "markdown.preview.linkify": true,
+  "markdown.extension.toc.levels": "2..6",
+  "markdown.extension.toc.orderedList": false,
+  "markdown.extension.toc.updateOnSave": true,
+
+  // Mermaid Settings
+  "markdown.mermaid.theme": "default",  // or "dark", "forest", "neutral"
+  
+  // Git Settings
+  "git.autofetch": true,
+  "git.confirmSync": false,
+  "git.enableSmartCommit": true,
+  "git.postCommitCommand": "none",
+
+  // Terminal Settings
+  "terminal.integrated.defaultProfile.linux": "bash",
+  "terminal.integrated.scrollback": 10000,
+
+  // Breadcrumbs
+  "breadcrumbs.enabled": true,
+
+  // Explorer Settings
+  "explorer.confirmDelete": true,
+  "explorer.confirmDragAndDrop": true,
+  "explorer.sortOrder": "type",
+
+  // Security
+  "security.workspace.trust.enabled": true,
+
+  // Workbench
+  "workbench.editor.enablePreview": false,
+  "workbench.startupEditor": "readme"
+}
