@@ -1,0 +1,323 @@
+
+name: SLSA Build & SBOM
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'openssl/**/python/**'
+  push:
+    branches: [main]
+    paths:
+      - 'openssl/**/python/**'
+  workflow_dispatch:
+    inputs:
+      dockerfile_path:
+        description: 'Path to specific Dockerfile (e.g., openssl/3.0.9/alpine/3.2.1/python/3.10/Fips.Dockerfile)'
+        required: true
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+  attestations: write
+  actions: write  # For triggering provenance workflow
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # ===========================================================================
+  # Discover the changed directory and build
+  # ===========================================================================
+  build:
+    name: Build Image
+    runs-on: ubuntu-latest
+    outputs:
+      image_repo: ${{ steps.meta.outputs.image_repo }}
+      image_tag: ${{ steps.meta.outputs.image_tag }}
+      digest: ${{ steps.push.outputs.digest }}
+      image_name: ${{ steps.meta.outputs.image_name }}
+
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          egress-policy: audit
+
+      - name: Checkout
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+        with:
+          fetch-depth: 0
+
+      - name: Find changed Dockerfile
+        id: discover
+        run: |
+          # Handle manual dispatch
+          if [ -n "${{ github.event.inputs.dockerfile_path }}" ]; then
+            DOCKERFILE="${{ github.event.inputs.dockerfile_path }}"
+            echo "dockerfile=$DOCKERFILE" >> $GITHUB_OUTPUT
+            echo "context=$(dirname $DOCKERFILE)" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Find changed files
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            CHANGED=$(git diff --name-only \
+              "${{ github.event.pull_request.base.sha }}" \
+              "${{ github.event.pull_request.head.sha }}" | \
+              grep '^openssl/.*/python/' || true)
+          else
+            CHANGED=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}" | \
+              grep '^openssl/.*/python/' || true)
+          fi
+
+          if [ -z "$CHANGED" ]; then
+            echo "No changes detected in python directories"
+            exit 1
+          fi
+
+          # Get unique directories
+          DIRS=$(echo "$CHANGED" | while read -r f; do dirname "$f"; done | sort -u)
+          DIR_COUNT=$(echo "$DIRS" | wc -l)
+
+          if [ "$DIR_COUNT" -gt 1 ]; then
+            echo "::warning::Multiple directories changed. Building first one only: $(echo "$DIRS" | head -1)"
+            echo "::warning::For multiple directories, make separate commits or use workflow_dispatch"
+          fi
+
+          DIR=$(echo "$DIRS" | head -1)
+          DOCKERFILE="${DIR}/Fips.Dockerfile"
+
+          echo "dockerfile=$DOCKERFILE" >> $GITHUB_OUTPUT
+          echo "context=$DIR" >> $GITHUB_OUTPUT
+          echo "Building: $DOCKERFILE"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+
+      - name: Generate image metadata
+        id: meta
+        run: |
+          CONTEXT="${{ steps.discover.outputs.context }}"
+          REPO_OWNER=$(echo "${{ github.repository_owner }}" | tr '[:upper:]' '[:lower:]')
+          REPO_NAME=$(echo "${{ github.event.repository.name }}" | tr '[:upper:]' '[:lower:]')
+
+          # Generate image name from path
+          IMAGE_NAME=$(echo "$CONTEXT" | tr '/' '-' | tr '.' '-' | tr '[:upper:]' '[:lower:]' | \
+            sed 's/[^a-z0-9-]/-/g' | sed 's/--*/-/g' | sed 's/^-//' | sed 's/-$//')
+
+          IMAGE_REPO="${{ env.REGISTRY }}/${REPO_OWNER}/${REPO_NAME}/${IMAGE_NAME}"
+
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            IMAGE_TAG="pr-${{ github.event.pull_request.number }}"
+          else
+            IMAGE_TAG="$(date +%Y%m%d)-${GITHUB_SHA:0:7}"
+          fi
+
+          echo "image_name=$IMAGE_NAME" >> $GITHUB_OUTPUT
+          echo "image_repo=$IMAGE_REPO" >> $GITHUB_OUTPUT
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+      - name: Log in to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@263435318d21b8e681c14492fe198d362a7d2c83 # v6.18.0
+        with:
+          context: ${{ steps.discover.outputs.context }}
+          file: ${{ steps.discover.outputs.dockerfile }}
+          push: true
+          tags: |
+            ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }}
+            ${{ steps.meta.outputs.image_repo }}:latest
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=min
+          provenance: false
+          sbom: false
+
+      - name: Generate SBOM
+        uses: anchore/sbom-action@0b82b0b1a22399a1c542d4d656f70cd903571b5c # v0.21.1
+        with:
+          image: ${{ steps.meta.outputs.image_repo }}@${{ steps.push.outputs.digest }}
+          format: cyclonedx-json
+          output-file: sbom.cyclonedx.json
+
+      - name: Attest SBOM
+        uses: actions/attest-sbom@4651f806c01d8637787e274ac3bdf724ef169f34 # v3.0.0
+        id: attest-sbom
+        with:
+          subject-name: ${{ steps.meta.outputs.image_repo }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          sbom-path: sbom.cyclonedx.json
+          push-to-registry: true
+
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: sbom-${{ steps.meta.outputs.image_name }}
+          path: sbom.cyclonedx.json
+          retention-days: 90
+
+      - name: Generate build summary
+        env:
+          IMAGE_REF: ${{ steps.meta.outputs.image_repo }}:${{ steps.meta.outputs.image_tag }}
+          IMAGE_REPO: ${{ steps.meta.outputs.image_repo }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+          SBOM_ID: ${{ steps.attest-sbom.outputs.attestation-id }}
+          SBOM_URL: ${{ steps.attest-sbom.outputs.attestation-url }}
+          REPO: ${{ github.repository }}
+          IMAGE_NAME: ${{ steps.meta.outputs.image_name }}
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## Build Summary - ${IMAGE_NAME}
+
+          | Property | Value |
+          |----------|-------|
+          | **Image** | \`${IMAGE_REF}\` |
+          | **Digest** | \`${DIGEST}\` |
+          | **SBOM Attestation** | [${SBOM_ID}](${SBOM_URL}) |
+          | **SLSA Build Level** | L3 (provenance generated separately) |
+
+          ### Verification Commands
+
+          #### 1. Verify SBOM Attestation
+          \`\`\`bash
+          gh attestation verify \\
+            oci://${IMAGE_REPO}@${DIGEST} \\
+            --repo ${REPO} \\
+            --predicate-type https://cyclonedx.org/bom
+          \`\`\`
+
+          #### 2. Verify SLSA L3 Provenance (after provenance workflow completes)
+          \`\`\`bash
+          slsa-verifier verify-image \\
+            "${IMAGE_REPO}@${DIGEST}" \\
+            --source-uri github.com/${REPO}
+          \`\`\`
+
+          #### 3. Verify with Cosign
+          \`\`\`bash
+          cosign verify-attestation \\
+            ${IMAGE_REPO}@${DIGEST} \\
+            --type https://slsa.dev/provenance/v1 \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+            --certificate-identity-regexp "^https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v[0-9]+.*"
+          \`\`\`
+
+          #### 4. Pull Image
+          \`\`\`bash
+          docker pull ${IMAGE_REPO}@${DIGEST}
+          \`\`\`
+          EOF
+
+  # ===========================================================================
+  # Generate SLSA L3 Provenance
+  # ===========================================================================
+  provenance:
+    needs: build
+    if: github.event_name == 'push'  # Only on push to main, not PRs
+    permissions:
+      actions: read
+      id-token: write
+      packages: write
+    uses: slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@v2.1.0
+    with:
+      image: ${{ needs.build.outputs.image_repo }}
+      digest: ${{ needs.build.outputs.digest }}
+      registry-username: ${{ github.actor }}
+    secrets:
+      registry-password: ${{ secrets.GITHUB_TOKEN }}
+
+  # ===========================================================================
+  # Verify with SLSA Verifier
+  # ===========================================================================
+  verify:
+    name: Verify L3 Provenance
+    needs: [build, provenance]
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@20cf305ff2072d973412fa9b1e3a4f227bda3c76 # v2.14.0
+        with:
+          egress-policy: audit
+
+      - name: Install slsa-verifier
+        uses: slsa-framework/slsa-verifier/actions/installer@3714a2a4684014deb874a0e737dffa0ee02dd647 # v2.7.0
+
+      - name: Log in to GHCR
+        uses: docker/login-action@5e57cd118135c172c3672efd75eb46360885c0ef # v3.6.0
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify provenance
+        run: |
+          slsa-verifier verify-image \
+            "${{ needs.build.outputs.image_repo }}@${{ needs.build.outputs.digest }}" \
+            --source-uri github.com/${{ github.repository }}
+
+      - name: Verification summary
+        env:
+          IMAGE_REPO: ${{ needs.build.outputs.image_repo }}
+          IMAGE_TAG: ${{ needs.build.outputs.image_tag }}
+          DIGEST: ${{ needs.build.outputs.digest }}
+          IMAGE_NAME: ${{ needs.build.outputs.image_name }}
+          REPO: ${{ github.repository }}
+        run: |
+          cat >> $GITHUB_STEP_SUMMARY << EOF
+          ## SLSA L3 Verification Passed - ${IMAGE_NAME}
+
+          | Property | Value |
+          |----------|-------|
+          | **Image** | \`${IMAGE_REPO}:${IMAGE_TAG}\` |
+          | **Digest** | \`${DIGEST}\` |
+          | **SLSA Level** | Build L3 |
+          | **Verified** | Yes |
+
+          ### Verification Commands (Run Locally)
+
+          #### 1. Verify SBOM Attestation
+          \`\`\`bash
+          gh attestation verify \\
+            oci://${IMAGE_REPO}@${DIGEST} \\
+            --repo ${REPO} \\
+            --predicate-type https://cyclonedx.org/bom
+          \`\`\`
+
+          #### 2. Verify SLSA L3 Provenance
+          \`\`\`bash
+          # Install slsa-verifier
+          go install github.com/slsa-framework/slsa-verifier/v2/cli/slsa-verifier@v2.7.0
+
+          # Verify provenance
+          slsa-verifier verify-image \\
+            "${IMAGE_REPO}@${DIGEST}" \\
+            --source-uri github.com/${REPO}
+          \`\`\`
+
+          #### 3. Verify with Cosign
+          \`\`\`bash
+          cosign verify-attestation \\
+            ${IMAGE_REPO}@${DIGEST} \\
+            --type https://slsa.dev/provenance/v1 \\
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \\
+            --certificate-identity-regexp "^https://github.com/slsa-framework/slsa-github-generator/.github/workflows/generator_container_slsa3.yml@refs/tags/v[0-9]+.*"
+          \`\`\`
+
+          #### 4. Pull Image
+          \`\`\`bash
+          docker pull ${IMAGE_REPO}@${DIGEST}
+          \`\`\`
+          EOF
